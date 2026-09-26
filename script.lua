@@ -1,3 +1,7 @@
+-- Отладочный поиск предметов для собственного проекта в Roblox Studio.
+-- Поместите этот LocalScript в StarterPlayer > StarterPlayerScripts.
+
+local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local TweenService = game:GetService("TweenService")
@@ -65,6 +69,10 @@ local currentCharacter = nil
 local currentRootPart = nil
 local inputChangedConnection = nil
 local inputEndedConnection = nil
+local draggingPanel = false
+local dragInputObject = nil
+local dragStartPosition = nil
+local frameStartPosition = nil
 local characterReferenceAddedConnection = nil
 local characterReferenceRemovingConnection = nil
 local startScanLoop
@@ -75,6 +83,9 @@ local function create(className, properties, parent)
 	local instance = Instance.new(className)
 	for property, value in pairs(properties) do
 		instance[property] = value
+	end
+	if instance:IsA("GuiButton") then
+		instance.Active = true
 	end
 	instance.Parent = parent
 	return instance
@@ -99,14 +110,28 @@ local panelCorner = create("UICorner", { CornerRadius = UDim.new(0, 8) }, frame)
 local titleLabel = create("TextLabel", {
 	Name = "Title",
 	Position = UDim2.fromOffset(12, 8),
-	Size = UDim2.new(1, -56, 0, 28),
+	Size = UDim2.new(1, -88, 0, 28),
 	BackgroundTransparency = 1,
 	Font = Enum.Font.GothamSemibold,
 	Text = "Поиск предметов (Studio)",
 	TextColor3 = Color3.fromRGB(240, 240, 245),
 	TextSize = 16,
 	TextXAlignment = Enum.TextXAlignment.Left,
+	Active = true,
 }, frame)
+
+local lockButton = create("TextButton", {
+	Name = "DragLockButton",
+	Position = UDim2.fromOffset(236, 8),
+	Size = UDim2.fromOffset(24, 24),
+	BackgroundColor3 = Color3.fromRGB(48, 51, 60),
+	BorderSizePixel = 0,
+	Font = Enum.Font.GothamBold,
+	Text = "🔓",
+	TextColor3 = Color3.fromRGB(240, 240, 245),
+	TextSize = 14,
+}, frame)
+create("UICorner", { CornerRadius = UDim.new(1, 0) }, lockButton)
 
 local collapseButton = create("TextButton", {
 	Name = "CollapseButton",
@@ -131,7 +156,10 @@ local function setPanelCollapsed(collapsed)
 	panelCorner.CornerRadius = collapsed and UDim.new(0, 20) or UDim.new(0, 8)
 
 	for _, child in ipairs(frame:GetChildren()) do
-		if child:IsA("GuiObject") and child ~= titleLabel and child ~= collapseButton then
+		if child:IsA("GuiObject")
+			and child ~= titleLabel
+			and child ~= collapseButton
+			and child ~= lockButton then
 			child.Visible = not collapsed
 		end
 	end
@@ -150,6 +178,32 @@ end
 
 collapseButton.Activated:Connect(function()
 	setPanelCollapsed(not panelCollapsed)
+end)
+
+local dragLocked = false
+lockButton.Activated:Connect(function()
+	dragLocked = not dragLocked
+	lockButton.Text = dragLocked and "🔒" or "🔓"
+	lockButton.BackgroundColor3 = dragLocked
+		and Color3.fromRGB(105, 67, 67)
+		or Color3.fromRGB(48, 51, 60)
+	if dragLocked then
+		draggingPanel = false
+		dragInputObject = nil
+	end
+end)
+
+titleLabel.InputBegan:Connect(function(input)
+	if dragLocked then
+		return
+	end
+	if input.UserInputType == Enum.UserInputType.MouseButton1
+		or input.UserInputType == Enum.UserInputType.Touch then
+		draggingPanel = true
+		dragInputObject = input.UserInputType == Enum.UserInputType.Touch and input or nil
+		dragStartPosition = input.Position
+		frameStartPosition = frame.Position
+	end
 end)
 
 local refreshButton = create("TextButton", {
@@ -411,11 +465,25 @@ inputChangedConnection = UserInputService.InputChanged:Connect(function(input)
 	if holdingSlider and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
 		updateSlider(input)
 	end
+	if draggingPanel and not dragLocked
+		and (input.UserInputType == Enum.UserInputType.MouseMovement or input == dragInputObject) then
+		local delta = input.Position - dragStartPosition
+		frame.Position = UDim2.new(
+			frameStartPosition.X.Scale,
+			frameStartPosition.X.Offset + delta.X,
+			frameStartPosition.Y.Scale,
+			frameStartPosition.Y.Offset + delta.Y
+		)
+	end
 end)
 
 inputEndedConnection = UserInputService.InputEnded:Connect(function(input)
 	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
 		holdingSlider = false
+	end
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input == dragInputObject then
+		draggingPanel = false
+		dragInputObject = nil
 	end
 end)
 
@@ -475,7 +543,15 @@ local function clearResults()
 end
 
 local function updateHighlight(adornee)
-	if not currentHighlight then
+	if not adornee then
+		if currentHighlight then
+			currentHighlight:Destroy()
+			currentHighlight = nil
+		end
+		return
+	end
+
+	if not currentHighlight or not currentHighlight.Parent then
 		currentHighlight = create("Highlight", {
 			Name = "StudioItemFinderHighlight",
 			FillColor = Color3.fromRGB(255, 196, 70),
@@ -485,6 +561,7 @@ local function updateHighlight(adornee)
 		}, Workspace)
 	end
 	currentHighlight.Adornee = adornee
+	currentHighlight.Enabled = true
 end
 
 local function interactWithObject(object, detectedTargetName)
@@ -519,7 +596,16 @@ local function scanWorkspace(allowMovement)
 
 	local rootPart = currentRootPart
 	if not rootPart or not rootPart.Parent or currentCharacter ~= player.Character then
+		statusLabel.Text = "Ожидаю персонажа и HumanoidRootPart..."
 		return
+	end
+
+	local hasEnabledTargets = false
+	for _, targetName in ipairs(TARGET_NAMES) do
+		if TARGET_ENABLED[targetName] then
+			hasEnabledTargets = true
+			break
+		end
 	end
 
 	local foundByObject = {}
@@ -574,7 +660,9 @@ local function scanWorkspace(allowMovement)
 	end
 	updateHighlight(nearest and nearest.adornee or nil)
 
-	if #results == 0 then
+	if not hasEnabledTargets then
+		statusLabel.Text = "Все фильтры выключены. Включите хотя бы один предмет."
+	elseif #results == 0 then
 		statusLabel.Text = (scanning and allowMovement ~= false) and "Предметы не найдены. Перехожу к точкам сканирования..." or "Предметы не найдены."
 	else
 		statusLabel.Text = string.format("Найдено: %d · лечу к ближайшему", #results)
@@ -591,7 +679,7 @@ local function scanWorkspace(allowMovement)
 		row.Visible = true
 	end
 
-	if scanning and allowMovement ~= false then
+	if scanning and allowMovement ~= false and hasEnabledTargets then
 		local targetPosition = nil
 		local actDist = 8
 
@@ -811,7 +899,12 @@ startScanLoop = function()
 	local thisGeneration = scanGeneration
 	task.spawn(function()
 		while scanning and scanGeneration == thisGeneration and screenGui.Parent do
-			scanWorkspace(true)
+			local ok, scanError = pcall(scanWorkspace, true)
+			if not ok then
+				warn("[StudioItemFinder] Ошибка сканирования: " .. tostring(scanError))
+				stopAutomation("Ошибка сканирования: " .. tostring(scanError))
+				break
+			end
 			if scanning and emptySpawnLaps >= 3 then
 				stopAutomation("Сервер пуст. Смена сервера требует серверного обработчика.")
 				break
@@ -835,12 +928,29 @@ end
 
 local function refreshAfterFilterChange()
 	emptySpawnLaps = 0
+	local hasEnabledTargets = false
+	for _, targetName in ipairs(TARGET_NAMES) do
+		if TARGET_ENABLED[targetName] then
+			hasEnabledTargets = true
+			break
+		end
+	end
+	if not hasEnabledTargets then
+		clearResults()
+		updateHighlight(nil)
+		statusLabel.Text = "Все фильтры выключены. Включите хотя бы один предмет."
+	end
+
 	if scanning then
 		scanGeneration += 1
 		cancelCurrentAction()
 		startScanLoop()
 	else
-		scanWorkspace(false)
+		local ok, scanError = pcall(scanWorkspace, false)
+		if not ok then
+			warn("[StudioItemFinder] Ошибка сканирования: " .. tostring(scanError))
+			statusLabel.Text = "Ошибка сканирования: " .. tostring(scanError)
+		end
 	end
 end
 
@@ -1015,7 +1125,11 @@ script.Destroying:Connect(function()
 	end
 end)
 refreshButton.Activated:Connect(function()
-	scanWorkspace(false)
+	local ok, scanError = pcall(scanWorkspace, false)
+	if not ok then
+		warn("[StudioItemFinder] Ошибка сканирования: " .. tostring(scanError))
+		statusLabel.Text = "Ошибка сканирования: " .. tostring(scanError)
+	end
 end)
 
 toggleButton.Activated:Connect(function()
@@ -1031,6 +1145,7 @@ toggleButton.Activated:Connect(function()
 		or Color3.fromRGB(60, 110, 78)
 
 	if scanning then
+		statusLabel.Text = "Сканирование запущено..."
 		startScanLoop()
 	else
 		cancelCurrentAction()
