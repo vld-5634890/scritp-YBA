@@ -2,10 +2,6 @@
 -- Поместите этот LocalScript в StarterPlayer > StarterPlayerScripts.
 
 local RunService = game:GetService("RunService")
-if not RunService:IsStudio() then
-	return
-end
-
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local TweenService = game:GetService("TweenService")
