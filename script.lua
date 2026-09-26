@@ -1,14 +1,28 @@
--- Отладочный поиск предметов для собственного проекта в Roblox Studio.
--- Поместите этот LocalScript в StarterPlayer > StarterPlayerScripts.
+-- Панель отладки автосбора для собственного проекта Roblox Studio.
+-- LocalScript поместить в StarterPlayer > StarterPlayerScripts.
+-- Скрипт намеренно работает только в Studio.
 
 local RunService = game:GetService("RunService")
+if not RunService:IsStudio() then
+	return
+end
+
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
+local ProximityPromptService = game:GetService("ProximityPromptService")
 
 local player = Players.LocalPlayer
+if not player then
+	return
+end
+
 local playerGui = player:WaitForChild("PlayerGui")
+local oldGui = playerGui:FindFirstChild("StudioItemFinder")
+if oldGui then
+	oldGui:Destroy()
+end
 
 local TARGET_NAMES = {
 	"Pure Rokakaka",
@@ -25,59 +39,55 @@ local TARGET_NAMES = {
 	"Steel Ball",
 }
 
+local TARGET_ENABLED = {}
 local sessionStats = {}
-local countedObjects = setmetatable({}, { __mode = "k" })
 for _, targetName in ipairs(TARGET_NAMES) do
+	TARGET_ENABLED[targetName] = true
 	sessionStats[targetName] = 0
 end
 
-local TARGET_ENABLED = {
-	["Pure Rokakaka"] = true,
-	["Mysterious Arrow"] = true,
-	["Lucky Arrow"] = true,
-	["Rokakaka"] = true,
-	["Rib Cage of the Saint's Corpse"] = true,
-	["Gold Coin"] = true,
-	["Diamond"] = true,
-	["Stone Mask"] = true,
-	["Ancient Scroll"] = true,
-	["Quinton's Glove"] = true,
-	["Headband"] = true,
-	["Steel Ball"] = true,
-}
-
-local SPAWN_POINTS = {
-	Vector3.new(100, 10, 100),
-	Vector3.new(-200, 15, 300),
-	Vector3.new(50, 5, -400),
-	Vector3.new(-50, 20, -50),
-}
-
+local MIN_SPEED = 25
+local MAX_SPEED = 125
 local SCAN_INTERVAL = 1
-local TARGET_BLACKLIST_DURATION = 30
-local MAX_RESULT_ROWS = 20
+local MAX_RESULT_ROWS = 15
+local LOCAL_SEARCH_RADII = { 400, 800, 1200, 1600, 2000 }
+local LOCAL_SEARCH_POINTS_PER_RING = 32
+local LOCAL_SEARCH_MAX_RADIUS = 2000
+local LOCAL_SEARCH_CLEARANCE = 8
+
 local scanning = false
 local scanGeneration = 0
-local currentHighlight = nil
 local currentSpeed = 25
-local currentSpawnIndex = 1
-local emptySpawnLaps = 0
-local targetBlacklist = {}
-local activeTween = nil
-local activePrompt = nil -- Для исправления бага с удержанием кнопки при выключении
-local currentCharacter = nil
-local currentRootPart = nil
-local inputChangedConnection = nil
-local inputEndedConnection = nil
-local draggingPanel = false
-local dragInputObject = nil
-local dragStartPosition = nil
-local frameStartPosition = nil
-local characterReferenceAddedConnection = nil
-local characterReferenceRemovingConnection = nil
+local currentCharacter
+local currentRootPart
+local activeTween
+local activePrompt
+local activePromptConnection
+local visiblePrompts = setmetatable({}, { __mode = "k" })
+local targetRetryAfter = setmetatable({}, { __mode = "k" })
+local patrolRoute = {}
+local patrolRouteIndex = 1
+local patrolCenter
+local lastItemPosition
+local routeRandom = Random.new()
+local scanHighlights = {}
+local noClipEnabled = false
+local originalCollisions = {}
+local originalAutoRotate = {}
+local noClipDescendantConnection
+local noClipCharacterConnection
 local startScanLoop
 local setNoClip
-local stopAutomation
+local scanWorkspace
+local toggleAutomation
+local statusLabel
+
+ProximityPromptService.PromptShown:Connect(function(prompt)
+	visiblePrompts[prompt] = true
+end)
+ProximityPromptService.PromptHidden:Connect(function(prompt)
+	visiblePrompts[prompt] = nil
+end)
 
 local function create(className, properties, parent)
 	local instance = Instance.new(className)
@@ -91,328 +101,268 @@ local function create(className, properties, parent)
 	return instance
 end
 
+local function getHighlightAdornee(target)
+	local object = target.object
+	if not object then
+		return nil
+	end
+	if object:IsA("Model") or object:IsA("BasePart") then
+		return object
+	end
+
+	local promptParent = target.prompt and target.prompt.Parent
+	local ancestor = promptParent and (
+		promptParent:FindFirstAncestorOfClass("Model")
+		or promptParent:FindFirstAncestorWhichIsA("BasePart")
+	)
+	if ancestor then
+		return ancestor
+	end
+	for _, descendant in ipairs(object:GetDescendants()) do
+		if descendant:IsA("Model") or descendant:IsA("BasePart") then
+			return descendant
+		end
+	end
+	return nil
+end
+
+local function updateScannedHighlights(results)
+	local currentObjects = {}
+	for _, target in ipairs(results) do
+		local object = target.object
+		local adornee = getHighlightAdornee(target)
+		if object and object.Parent and adornee then
+			currentObjects[object] = true
+			local highlight = scanHighlights[object]
+			if not highlight or not highlight.Parent then
+				highlight = Instance.new("Highlight")
+				highlight.Name = "ScannedItemHighlight"
+				highlight.FillColor = Color3.fromRGB(119, 190, 132)
+				highlight.FillTransparency = 0.58
+				highlight.OutlineColor = Color3.fromRGB(155, 211, 165)
+				highlight.OutlineTransparency = 0.12
+				highlight.DepthMode = Enum.HighlightDepthMode.Occluded
+				highlight.Parent = Workspace
+				scanHighlights[object] = highlight
+			end
+			highlight.Adornee = adornee
+		end
+	end
+
+	for object, highlight in pairs(scanHighlights) do
+		if not currentObjects[object] or not object.Parent then
+			highlight:Destroy()
+			scanHighlights[object] = nil
+		end
+	end
+end
+
 local screenGui = create("ScreenGui", {
 	Name = "StudioItemFinder",
 	ResetOnSpawn = false,
 	IgnoreGuiInset = true,
+	DisplayOrder = 100,
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
 }, playerGui)
 
 local frame = create("Frame", {
 	Name = "Panel",
 	AnchorPoint = Vector2.new(0, 0.5),
-	Position = UDim2.new(0, 20, 0.5, 0),
-	Size = UDim2.fromOffset(300, 580),
-	BackgroundColor3 = Color3.fromRGB(28, 30, 36),
+	Position = UDim2.new(0, 18, 0.5, 0),
+	Size = UDim2.fromOffset(340, 590),
+	BackgroundColor3 = Color3.fromRGB(23, 26, 33),
 	BorderSizePixel = 0,
 }, screenGui)
-local panelCorner = create("UICorner", { CornerRadius = UDim.new(0, 8) }, frame)
+local frameCorner = create("UICorner", {
+	CornerRadius = UDim.new(0, 10),
+}, frame)
+create("UIStroke", {
+	Color = Color3.fromRGB(64, 72, 88),
+	Transparency = 0.35,
+	Thickness = 1,
+}, frame)
+
+local header = create("Frame", {
+	Name = "Header",
+	Position = UDim2.fromOffset(0, 0),
+	Size = UDim2.new(1, 0, 0, 40),
+	BackgroundColor3 = Color3.fromRGB(30, 34, 43),
+	BorderSizePixel = 0,
+}, frame)
+create("UICorner", {
+	CornerRadius = UDim.new(0, 10),
+}, header)
 
 local titleLabel = create("TextLabel", {
 	Name = "Title",
-	Position = UDim2.fromOffset(12, 8),
-	Size = UDim2.new(1, -88, 0, 28),
+	Position = UDim2.fromOffset(14, 0),
+	Size = UDim2.new(1, -62, 1, 0),
 	BackgroundTransparency = 1,
-	Font = Enum.Font.GothamSemibold,
-	Text = "Поиск предметов (Studio)",
-	TextColor3 = Color3.fromRGB(240, 240, 245),
-	TextSize = 16,
+	Font = Enum.Font.GothamMedium,
+	Text = "ПОИСК ПРЕДМЕТОВ · STUDIO",
+	TextColor3 = Color3.fromRGB(239, 242, 248),
+	TextSize = 13,
 	TextXAlignment = Enum.TextXAlignment.Left,
-	Active = true,
-}, frame)
-
-local lockButton = create("TextButton", {
-	Name = "DragLockButton",
-	Position = UDim2.fromOffset(236, 8),
-	Size = UDim2.fromOffset(24, 24),
-	BackgroundColor3 = Color3.fromRGB(48, 51, 60),
-	BorderSizePixel = 0,
-	Font = Enum.Font.GothamBold,
-	Text = "🔓",
-	TextColor3 = Color3.fromRGB(240, 240, 245),
-	TextSize = 14,
-}, frame)
-create("UICorner", { CornerRadius = UDim.new(1, 0) }, lockButton)
+}, header)
 
 local collapseButton = create("TextButton", {
 	Name = "CollapseButton",
-	Position = UDim2.fromOffset(264, 8),
-	Size = UDim2.fromOffset(24, 24),
-	BackgroundColor3 = Color3.fromRGB(48, 51, 60),
+	Position = UDim2.new(1, -38, 0, 7),
+	Size = UDim2.fromOffset(26, 26),
+	BackgroundColor3 = Color3.fromRGB(48, 54, 66),
 	BorderSizePixel = 0,
 	Font = Enum.Font.GothamBold,
-	Text = "-",
-	TextColor3 = Color3.fromRGB(240, 240, 245),
-	TextSize = 18,
-}, frame)
+	Text = "−",
+	TextColor3 = Color3.fromRGB(245, 246, 250),
+	TextSize = 17,
+}, header)
 create("UICorner", { CornerRadius = UDim.new(1, 0) }, collapseButton)
-
-local expandedPanelSize = frame.Size
-local panelCollapsed = false
-local collapseTween = nil
-
-local function setPanelCollapsed(collapsed)
-	panelCollapsed = collapsed
-	collapseButton.Text = collapsed and "+" or "-"
-	panelCorner.CornerRadius = collapsed and UDim.new(0, 20) or UDim.new(0, 8)
-
-	for _, child in ipairs(frame:GetChildren()) do
-		if child:IsA("GuiObject")
-			and child ~= titleLabel
-			and child ~= collapseButton
-			and child ~= lockButton then
-			child.Visible = not collapsed
-		end
-	end
-
-	if collapseTween then
-		collapseTween:Cancel()
-	end
-	local targetSize = collapsed and UDim2.fromOffset(300, 40) or expandedPanelSize
-	collapseTween = TweenService:Create(
-		frame,
-		TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
-		{ Size = targetSize }
-	)
-	collapseTween:Play()
-end
-
-collapseButton.Activated:Connect(function()
-	setPanelCollapsed(not panelCollapsed)
-end)
-
-local dragLocked = false
-lockButton.Activated:Connect(function()
-	dragLocked = not dragLocked
-	lockButton.Text = dragLocked and "🔒" or "🔓"
-	lockButton.BackgroundColor3 = dragLocked
-		and Color3.fromRGB(105, 67, 67)
-		or Color3.fromRGB(48, 51, 60)
-	if dragLocked then
-		draggingPanel = false
-		dragInputObject = nil
-	end
-end)
-
-titleLabel.InputBegan:Connect(function(input)
-	if dragLocked then
-		return
-	end
-	if input.UserInputType == Enum.UserInputType.MouseButton1
-		or input.UserInputType == Enum.UserInputType.Touch then
-		draggingPanel = true
-		dragInputObject = input.UserInputType == Enum.UserInputType.Touch and input or nil
-		dragStartPosition = input.Position
-		frameStartPosition = frame.Position
-	end
-end)
-
-local refreshButton = create("TextButton", {
-	Name = "RefreshButton",
-	Position = UDim2.fromOffset(12, 44),
-	Size = UDim2.fromOffset(128, 32),
-	BackgroundColor3 = Color3.fromRGB(65, 91, 140),
-	BorderSizePixel = 0,
-	Font = Enum.Font.Gotham,
-	Text = "Обновить",
-	TextColor3 = Color3.new(1, 1, 1),
-	TextSize = 13,
-}, frame)
-create("UICorner", { CornerRadius = UDim.new(0, 6) }, refreshButton)
 
 local toggleButton = create("TextButton", {
 	Name = "ToggleButton",
-	Position = UDim2.fromOffset(150, 44),
-	Size = UDim2.fromOffset(138, 32),
-	BackgroundColor3 = Color3.fromRGB(60, 110, 78),
-	BorderSizePixel = 0,
-	Font = Enum.Font.Gotham,
-	Text = "Авто-сбор: выкл",
-	TextColor3 = Color3.new(1, 1, 1),
-	TextSize = 12,
-}, frame)
-create("UICorner", { CornerRadius = UDim.new(0, 6) }, toggleButton)
-
-local sliderFrame = create("Frame", {
-	Name = "SliderFrame",
-	Position = UDim2.fromOffset(12, 88),
+	Position = UDim2.fromOffset(12, 48),
 	Size = UDim2.new(1, -24, 0, 40),
-	BackgroundColor3 = Color3.fromRGB(35, 38, 45),
+	BackgroundColor3 = Color3.fromRGB(55, 63, 78),
+	AutoButtonColor = false,
+	BorderSizePixel = 0,
+	Font = Enum.Font.GothamMedium,
+	Text = "Авто-сбор: выкл",
+	TextColor3 = Color3.fromRGB(248, 249, 252),
+	TextSize = 13,
+	ZIndex = 5,
+}, frame)
+create("UICorner", { CornerRadius = UDim.new(0, 8) }, toggleButton)
+
+local function updateToggleVisual()
+	toggleButton.Text = scanning and "Авто-сбор: вкл" or "Авто-сбор: выкл"
+	toggleButton.BackgroundColor3 = scanning
+		and Color3.fromRGB(42, 132, 98)
+		or Color3.fromRGB(55, 63, 78)
+end
+
+local function cancelCurrentAction()
+	if activeTween then
+		pcall(function()
+			activeTween:Cancel()
+		end)
+		activeTween = nil
+	end
+	if activePrompt then
+		pcall(function()
+			activePrompt:InputHoldEnd()
+		end)
+		activePrompt = nil
+	end
+	if activePromptConnection then
+		activePromptConnection:Disconnect()
+		activePromptConnection = nil
+	end
+end
+
+-- Подключаем главный переключатель сразу при создании.
+-- Даже если инициализация сканера завершится ошибкой, нажатие изменит состояние и покажет причину.
+toggleButton.Activated:Connect(function()
+	if toggleAutomation then
+		local ok, err = pcall(toggleAutomation)
+		if not ok then
+			scanning = false
+			scanGeneration += 1
+			cancelCurrentAction()
+			if setNoClip then
+				pcall(setNoClip, false)
+			end
+			updateToggleVisual()
+			if statusLabel then
+				statusLabel.Text = "Ошибка кнопки: " .. tostring(err)
+			end
+			warn("[StudioItemFinder] Ошибка переключателя: " .. tostring(err))
+		end
+	else
+		scanning = not scanning
+		updateToggleVisual()
+		if statusLabel then
+			statusLabel.Text = "Инициализация сканера..."
+		end
+	end
+end)
+
+local speedPanel = create("Frame", {
+	Name = "SpeedPanel",
+	Position = UDim2.fromOffset(12, 98),
+	Size = UDim2.new(1, -24, 0, 48),
+	BackgroundColor3 = Color3.fromRGB(32, 36, 45),
 	BorderSizePixel = 0,
 }, frame)
-create("UICorner", { CornerRadius = UDim.new(0, 6) }, sliderFrame)
+create("UICorner", { CornerRadius = UDim.new(0, 7) }, speedPanel)
 
-local sliderLabel = create("TextLabel", {
-	Name = "SliderLabel",
+local speedLabel = create("TextLabel", {
+	Name = "SpeedLabel",
 	Position = UDim2.fromOffset(10, 4),
 	Size = UDim2.new(1, -20, 0, 16),
 	BackgroundTransparency = 1,
 	Font = Enum.Font.Gotham,
 	Text = "Скорость полёта: 25 studs/s",
-	TextColor3 = Color3.fromRGB(200, 200, 205),
+	TextColor3 = Color3.fromRGB(198, 204, 216),
 	TextSize = 11,
 	TextXAlignment = Enum.TextXAlignment.Left,
-}, sliderFrame)
+}, speedPanel)
 
-local sliderBtn = create("TextButton", {
-	Name = "SliderBtn",
-	Position = UDim2.new(0, 10, 0, 24),
+local sliderTrack = create("TextButton", {
+	Name = "SpeedSlider",
+	Position = UDim2.new(0, 10, 0, 29),
 	Size = UDim2.new(1, -20, 0, 8),
-	BackgroundColor3 = Color3.fromRGB(55, 60, 70),
+	BackgroundColor3 = Color3.fromRGB(57, 64, 78),
+	BorderSizePixel = 0,
 	Text = "",
-}, sliderFrame)
+}, speedPanel)
+create("UICorner", { CornerRadius = UDim.new(1, 0) }, sliderTrack)
 
 local sliderFill = create("Frame", {
-	Name = "Fill",
-	Size = UDim2.new(0.44, 0, 1, 0),
-	BackgroundColor3 = Color3.fromRGB(100, 150, 240),
+	Name = "SliderFill",
+	Size = UDim2.new((currentSpeed - MIN_SPEED) / (MAX_SPEED - MIN_SPEED), 0, 1, 0),
+	BackgroundColor3 = Color3.fromRGB(100, 164, 246),
 	BorderSizePixel = 0,
-}, sliderBtn)
+}, sliderTrack)
+create("UICorner", { CornerRadius = UDim.new(1, 0) }, sliderFill)
 
-local statusLabel = create("TextLabel", {
+statusLabel = create("TextLabel", {
 	Name = "Status",
-	Position = UDim2.fromOffset(12, 138),
-	Size = UDim2.new(1, -24, 0, 24),
+	Position = UDim2.fromOffset(12, 151),
+	Size = UDim2.new(1, -24, 0, 26),
 	BackgroundTransparency = 1,
 	Font = Enum.Font.Gotham,
-	Text = "Нажмите «Авто-сбор» для запуска.",
-	TextColor3 = Color3.fromRGB(190, 194, 205),
-	TextSize = 12,
+	Text = "Готово · нажмите «Авто-сбор»",
+	TextColor3 = Color3.fromRGB(185, 192, 205),
+	TextSize = 11,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextTruncate = Enum.TextTruncate.AtEnd,
+}, frame)
+
+create("TextLabel", {
+	Name = "ResultsTitle",
+	Position = UDim2.fromOffset(12, 181),
+	Size = UDim2.new(1, -24, 0, 18),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.GothamMedium,
+	Text = "НАЙДЕННЫЕ ПРЕДМЕТЫ",
+	TextColor3 = Color3.fromRGB(167, 177, 194),
+	TextSize = 10,
 	TextXAlignment = Enum.TextXAlignment.Left,
 }, frame)
 
 local resultsFrame = create("ScrollingFrame", {
 	Name = "Results",
-	Position = UDim2.fromOffset(12, 168),
-	Size = UDim2.new(1, -24, 1, -400),
-	BackgroundColor3 = Color3.fromRGB(21, 23, 28),
+	Position = UDim2.fromOffset(12, 203),
+	Size = UDim2.new(1, -24, 0, 145),
+	BackgroundColor3 = Color3.fromRGB(17, 20, 26),
 	BorderSizePixel = 0,
 	CanvasSize = UDim2.new(),
 	ScrollBarThickness = 5,
+	ScrollBarImageColor3 = Color3.fromRGB(100, 108, 124),
 }, frame)
-create("UICorner", { CornerRadius = UDim.new(0, 6) }, resultsFrame)
+create("UICorner", { CornerRadius = UDim.new(0, 7) }, resultsFrame)
 
-local statsLabel = create("TextLabel", {
-	Name = "SessionStats",
-	Position = UDim2.fromOffset(12, 358),
-	Size = UDim2.new(1, -24, 0, 54),
-	BackgroundTransparency = 1,
-	Font = Enum.Font.Gotham,
-	Text = "",
-	TextColor3 = Color3.fromRGB(200, 204, 215),
-	TextSize = 9,
-	TextWrapped = true,
-	TextXAlignment = Enum.TextXAlignment.Left,
-	TextYAlignment = Enum.TextYAlignment.Top,
-}, frame)
-
-local function updateStatsLabel()
-	local collected = {}
-
-	for _, targetName in ipairs(TARGET_NAMES) do
-		local count = sessionStats[targetName] or 0
-		if count > 0 then
-			table.insert(collected, string.format("%s ×%d", targetName, count))
-		end
-	end
-
-	if #collected == 0 then
-		statsLabel.Text = "Собрано за сессию: пока ничего"
-	else
-		statsLabel.Text = "Собрано за сессию: " .. table.concat(collected, " · ")
-	end
-end
-
-updateStatsLabel()
-
-local filterScrollingFrame = create("ScrollingFrame", {
-	Name = "FilterScrollingFrame",
-	Position = UDim2.fromOffset(12, 418),
-	Size = UDim2.new(1, -24, 0, 150),
-	BackgroundTransparency = 1,
-	BorderSizePixel = 0,
-	CanvasSize = UDim2.new(0, 0, 0, 350),
-	ScrollingDirection = Enum.ScrollingDirection.Y,
-	ScrollBarThickness = 5,
-	ScrollBarImageColor3 = Color3.fromRGB(105, 110, 124),
-}, frame)
-
-create("TextLabel", {
-	Name = "FilterTitle",
-	Position = UDim2.fromOffset(6, 4),
-	Size = UDim2.fromOffset(100, 22),
-	BackgroundTransparency = 1,
-	Font = Enum.Font.GothamSemibold,
-	Text = "Фильтр предметов",
-	TextColor3 = Color3.fromRGB(200, 204, 215),
-	TextSize = 11,
-	TextXAlignment = Enum.TextXAlignment.Left,
-}, filterScrollingFrame)
-
-local enableAllButton = create("TextButton", {
-	Name = "EnableAllButton",
-	Position = UDim2.fromOffset(110, 4),
-	Size = UDim2.fromOffset(76, 22),
-	BackgroundColor3 = Color3.fromRGB(54, 93, 70),
-	BorderSizePixel = 0,
-	Font = Enum.Font.Gotham,
-	Text = "Включить всё",
-	TextColor3 = Color3.fromRGB(235, 237, 242),
-	TextSize = 9,
-	TextTruncate = Enum.TextTruncate.AtEnd,
-}, filterScrollingFrame)
-create("UICorner", { CornerRadius = UDim.new(0, 5) }, enableAllButton)
-
-local disableAllButton = create("TextButton", {
-	Name = "DisableAllButton",
-	Position = UDim2.fromOffset(190, 4),
-	Size = UDim2.fromOffset(80, 22),
-	BackgroundColor3 = Color3.fromRGB(74, 55, 55),
-	BorderSizePixel = 0,
-	Font = Enum.Font.Gotham,
-	Text = "Выключить всё",
-	TextColor3 = Color3.fromRGB(235, 237, 242),
-	TextSize = 9,
-	TextTruncate = Enum.TextTruncate.AtEnd,
-}, filterScrollingFrame)
-create("UICorner", { CornerRadius = UDim.new(0, 5) }, disableAllButton)
-
-local filterButtons = {}
-local filterDefinitions = {
-	{ name = "Pure Rokakaka", position = UDim2.fromOffset(6, 34) },
-	{ name = "Mysterious Arrow", position = UDim2.fromOffset(6, 60) },
-	{ name = "Lucky Arrow", position = UDim2.fromOffset(6, 86) },
-	{ name = "Rokakaka", position = UDim2.fromOffset(6, 112) },
-	{ name = "Rib Cage of the Saint's Corpse", position = UDim2.fromOffset(6, 138) },
-	{ name = "Gold Coin", position = UDim2.fromOffset(6, 164) },
-	{ name = "Diamond", position = UDim2.fromOffset(6, 190) },
-	{ name = "Stone Mask", position = UDim2.fromOffset(6, 216) },
-	{ name = "Ancient Scroll", position = UDim2.fromOffset(6, 242) },
-	{ name = "Quinton's Glove", position = UDim2.fromOffset(6, 268) },
-	{ name = "Headband", position = UDim2.fromOffset(6, 294) },
-	{ name = "Steel Ball", position = UDim2.fromOffset(6, 320) },
-}
-
-for _, definition in ipairs(filterDefinitions) do
-	local targetName = definition.name
-	local enabled = TARGET_ENABLED[targetName]
-	local button = create("TextButton", {
-		Name = "Filter_" .. string.gsub(targetName, "%W", ""),
-		Position = definition.position,
-		Size = UDim2.new(1, -18, 0, 22),
-		BackgroundColor3 = enabled and Color3.fromRGB(54, 93, 70) or Color3.fromRGB(48, 51, 60),
-		BorderSizePixel = 0,
-		Font = Enum.Font.Gotham,
-		Text = (enabled and "[✓] " or "[ ] ") .. targetName,
-		TextColor3 = Color3.fromRGB(235, 237, 242),
-		TextSize = 10,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		TextTruncate = Enum.TextTruncate.AtEnd,
-	}, filterScrollingFrame)
-	create("UICorner", { CornerRadius = UDim.new(0, 5) }, button)
-	filterButtons[targetName] = button
-end
-
-local listLayout = create("UIListLayout", {
+local resultLayout = create("UIListLayout", {
 	Padding = UDim.new(0, 4),
 	SortOrder = Enum.SortOrder.LayoutOrder,
 }, resultsFrame)
@@ -423,495 +373,125 @@ create("UIPadding", {
 	PaddingRight = UDim.new(0, 6),
 }, resultsFrame)
 
-local resultRowPool = {}
+local resultRows = {}
 for index = 1, MAX_RESULT_ROWS do
-	local row = create("TextLabel", {
+	resultRows[index] = create("TextLabel", {
 		Name = "Result" .. index,
 		LayoutOrder = index,
-		Size = UDim2.new(1, -4, 0, 34),
-		BackgroundColor3 = Color3.fromRGB(34, 36, 43),
+		Size = UDim2.new(1, -4, 0, 25),
+		BackgroundColor3 = Color3.fromRGB(35, 39, 48),
 		BorderSizePixel = 0,
 		Font = Enum.Font.Gotham,
 		Text = "",
-		TextColor3 = Color3.fromRGB(232, 234, 240),
-		TextSize = 11,
+		TextColor3 = Color3.fromRGB(228, 232, 240),
+		TextSize = 10,
 		TextTruncate = Enum.TextTruncate.AtEnd,
 		TextXAlignment = Enum.TextXAlignment.Left,
 		Visible = false,
 	}, resultsFrame)
-	resultRowPool[index] = row
+	create("UICorner", { CornerRadius = UDim.new(0, 5) }, resultRows[index])
 end
 
-listLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
-	resultsFrame.CanvasSize = UDim2.new(0, 0, 0, listLayout.AbsoluteContentSize.Y + 12)
+resultLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+	resultsFrame.CanvasSize = UDim2.new(0, 0, 0, resultLayout.AbsoluteContentSize.Y + 12)
 end)
 
-local holdingSlider = false
-local function updateSlider(input)
-	local percentage = math.clamp((input.Position.X - sliderBtn.AbsolutePosition.X) / sliderBtn.AbsoluteSize.X, 0, 1)
-	sliderFill.Size = UDim2.new(percentage, 0, 1, 0)
-	currentSpeed = math.round(5 + (percentage * 45))
-	sliderLabel.Text = "Скорость полёта: " .. currentSpeed .. " studs/s"
-end
+local statsLabel = create("TextLabel", {
+	Name = "SessionStats",
+	Position = UDim2.fromOffset(12, 355),
+	Size = UDim2.new(1, -24, 0, 40),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.Gotham,
+	Text = "",
+	TextColor3 = Color3.fromRGB(195, 201, 213),
+	TextSize = 10,
+	TextWrapped = true,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextYAlignment = Enum.TextYAlignment.Top,
+}, frame)
 
-sliderBtn.InputBegan:Connect(function(input)
-	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-		holdingSlider = true
-		updateSlider(input)
-	end
-end)
-
-inputChangedConnection = UserInputService.InputChanged:Connect(function(input)
-	if holdingSlider and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-		updateSlider(input)
-	end
-	if draggingPanel and not dragLocked
-		and (input.UserInputType == Enum.UserInputType.MouseMovement or input == dragInputObject) then
-		local delta = input.Position - dragStartPosition
-		frame.Position = UDim2.new(
-			frameStartPosition.X.Scale,
-			frameStartPosition.X.Offset + delta.X,
-			frameStartPosition.Y.Scale,
-			frameStartPosition.Y.Offset + delta.Y
-		)
-	end
-end)
-
-inputEndedConnection = UserInputService.InputEnded:Connect(function(input)
-	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-		holdingSlider = false
-	end
-	if input.UserInputType == Enum.UserInputType.MouseButton1 or input == dragInputObject then
-		draggingPanel = false
-		dragInputObject = nil
-	end
-end)
-
-local function findTargetName(objectName)
-	local loweredName = string.lower(objectName)
+local function updateStatsLabel()
+	local entries = {}
 	for _, targetName in ipairs(TARGET_NAMES) do
-		if string.find(loweredName, string.lower(targetName), 1, true) then
-			return targetName
+		local count = sessionStats[targetName] or 0
+		if count > 0 then
+			table.insert(entries, targetName .. " ×" .. tostring(count))
 		end
 	end
-	return nil
+	statsLabel.Text = #entries == 0
+		and "Собрано за сессию: пока ничего"
+		or "Собрано за сессию: " .. table.concat(entries, " · ")
 end
+updateStatsLabel()
 
-local function getHighlightAdornee(object)
-	if object:IsA("Model") or object:IsA("BasePart") then
-		return object
-	end
-	local containingModel = object:FindFirstAncestorOfClass("Model")
-	if containingModel then
-		return containingModel
-	end
-	for _, descendant in ipairs(object:GetDescendants()) do
-		if descendant:IsA("BasePart") then
-			return descendant
-		end
-	end
-	return nil
-end
+create("TextLabel", {
+	Name = "FilterTitle",
+	Position = UDim2.fromOffset(12, 401),
+	Size = UDim2.fromOffset(118, 24),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.GothamMedium,
+	Text = "ФИЛЬТРЫ",
+	TextColor3 = Color3.fromRGB(167, 177, 194),
+	TextSize = 10,
+	TextXAlignment = Enum.TextXAlignment.Left,
+}, frame)
 
--- Исправление бага с Attachment: корректно определяем мировую позицию для любых объектов
-local function getObjectWorldPosition(object)
-	if object:IsA("BasePart") then
-		return object.Position
-	elseif object:IsA("Attachment") then
-		return object.WorldPosition
-	elseif object:IsA("Model") then
-		return object:GetPivot().Position
-	end
-	return nil
-end
+local filterButtons = {}
+local filterScroll = create("ScrollingFrame", {
+	Name = "Filters",
+	Position = UDim2.fromOffset(12, 433),
+	Size = UDim2.new(1, -24, 0, 144),
+	BackgroundColor3 = Color3.fromRGB(29, 33, 41),
+	BorderSizePixel = 0,
+	CanvasSize = UDim2.new(0, 0, 0, #TARGET_NAMES * 26 + 8),
+	ScrollingDirection = Enum.ScrollingDirection.Y,
+	ScrollBarThickness = 5,
+	ScrollBarImageColor3 = Color3.fromRGB(100, 108, 124),
+}, frame)
+create("UICorner", { CornerRadius = UDim.new(0, 7) }, filterScroll)
 
-local function getPromptData(object)
-	local prompt = object:FindFirstChildOfClass("ProximityPrompt") or (object.Parent and object.Parent:FindFirstChildOfClass("ProximityPrompt"))
-	if not prompt then
-		for _, desc in ipairs(object:GetDescendants()) do
-			if desc:IsA("ProximityPrompt") then prompt = desc break end
-		end
-	end
-	return prompt
-end
+local enableAllButton = create("TextButton", {
+	Name = "EnableAll",
+	Position = UDim2.new(1, -202, 0, 401),
+	Size = UDim2.fromOffset(92, 24),
+	BackgroundColor3 = Color3.fromRGB(47, 91, 70),
+	BorderSizePixel = 0,
+	Font = Enum.Font.Gotham,
+	Text = "Включить все",
+	TextColor3 = Color3.fromRGB(238, 241, 247),
+	TextSize = 9,
+}, frame)
+create("UICorner", { CornerRadius = UDim.new(0, 5) }, enableAllButton)
 
-local function clearResults()
-	for _, row in ipairs(resultRowPool) do
-		row.Visible = false
-		row.Text = ""
-	end
-end
+local disableAllButton = create("TextButton", {
+	Name = "DisableAll",
+	Position = UDim2.new(1, -106, 0, 401),
+	Size = UDim2.fromOffset(94, 24),
+	BackgroundColor3 = Color3.fromRGB(83, 54, 59),
+	BorderSizePixel = 0,
+	Font = Enum.Font.Gotham,
+	Text = "Выключить",
+	TextColor3 = Color3.fromRGB(238, 241, 247),
+	TextSize = 9,
+}, frame)
+create("UICorner", { CornerRadius = UDim.new(0, 5) }, disableAllButton)
 
-local function updateHighlight(adornee)
-	if not adornee then
-		if currentHighlight then
-			currentHighlight:Destroy()
-			currentHighlight = nil
-		end
-		return
-	end
-
-	if not currentHighlight or not currentHighlight.Parent then
-		currentHighlight = create("Highlight", {
-			Name = "StudioItemFinderHighlight",
-			FillColor = Color3.fromRGB(255, 196, 70),
-			OutlineColor = Color3.fromRGB(255, 240, 190),
-			FillTransparency = 0.55,
-			DepthMode = Enum.HighlightDepthMode.AlwaysOnTop,
-		}, Workspace)
-	end
-	currentHighlight.Adornee = adornee
-	currentHighlight.Enabled = true
-end
-
-local function interactWithObject(object, detectedTargetName)
-	local prompt = getPromptData(object)
-	if prompt and prompt.Enabled then
-		activePrompt = prompt
-		statusLabel.Text = "Активация взаимодействия..."
-		task.wait(0.1)
-		if scanning and activePrompt == prompt then
-			prompt:InputHoldBegin()
-			task.wait(prompt.HoldDuration + 0.05)
-			if activePrompt == prompt then
-				prompt:InputHoldEnd()
-
-				local targetName = findTargetName(detectedTargetName or "")
-					or findTargetName(object.Name)
-				if targetName
-					and sessionStats[targetName] ~= nil
-					and not countedObjects[object] then
-					countedObjects[object] = true
-					sessionStats[targetName] += 1
-					updateStatsLabel()
-				end
-			end
-		end
-		activePrompt = nil
-	end
-end
-
-local function scanWorkspace(allowMovement)
-	clearResults()
-
-	local rootPart = currentRootPart
-	if not rootPart or not rootPart.Parent or currentCharacter ~= player.Character then
-		statusLabel.Text = "Ожидаю персонажа и HumanoidRootPart..."
-		return
-	end
-
-	local hasEnabledTargets = false
-	for _, targetName in ipairs(TARGET_NAMES) do
-		if TARGET_ENABLED[targetName] then
-			hasEnabledTargets = true
-			break
-		end
-	end
-
-	local foundByObject = {}
-	local results = {}
-	local scanTime = os.clock()
-
-	for adornee, expiresAt in pairs(targetBlacklist) do
-		if expiresAt <= scanTime or not adornee:IsDescendantOf(Workspace) then
-			targetBlacklist[adornee] = nil
-		end
-	end
-
-	for _, object in ipairs(Workspace:GetDescendants()) do
-		local targetName = findTargetName(object.Name)
-		if targetName and TARGET_ENABLED[targetName] then
-			local adornee = getHighlightAdornee(object)
-			local blockedUntil = adornee and targetBlacklist[adornee]
-			if adornee and not blockedUntil and not foundByObject[adornee] then
-				foundByObject[adornee] = true
-				
-				local prompt = getPromptData(adornee)
-				local targetObject = prompt and prompt.Parent or adornee
-				local position = getObjectWorldPosition(targetObject)
-				
-				if position then
-					local distance = (rootPart.Position - position).Magnitude
-					local actDistance = prompt and prompt.MaxActivationDistance or 8
-					
-					table.insert(results, {
-						adornee = adornee,
-						distance = distance,
-						name = targetName,
-						objectName = adornee.Name,
-						position = position,
-						activationDistance = actDistance
-					})
-				end
-			end
-		end
-	end
-
-	table.sort(results, function(a, b)
-		if a.distance and b.distance then return a.distance < b.distance
-		elseif a.distance then return true
-		elseif b.distance then return false end
-		return a.name < b.name
-	end)
-
-	local nearest = results[1]
-	if nearest then
-		emptySpawnLaps = 0
-	end
-	updateHighlight(nearest and nearest.adornee or nil)
-
-	if not hasEnabledTargets then
-		statusLabel.Text = "Все фильтры выключены. Включите хотя бы один предмет."
-	elseif #results == 0 then
-		statusLabel.Text = (scanning and allowMovement ~= false) and "Предметы не найдены. Перехожу к точкам сканирования..." or "Предметы не найдены."
-	else
-		statusLabel.Text = string.format("Найдено: %d · лечу к ближайшему", #results)
-	end
-
-	-- Перезаполняем уже созданные строки, не создавая новые GUI-объекты при каждом скане.
-	for index = 1, math.min(#results, MAX_RESULT_ROWS) do
-		local result = results[index]
-		local row = resultRowPool[index]
-		local distanceText = result.distance and string.format("%.0f studs", result.distance) or "неизвестно"
-		row.LayoutOrder = index
-		row.BackgroundColor3 = index == 1 and Color3.fromRGB(56, 52, 39) or Color3.fromRGB(34, 36, 43)
-		row.Text = string.format("%s · %s · %s", result.name, result.objectName, distanceText)
-		row.Visible = true
-	end
-
-	if scanning and allowMovement ~= false and hasEnabledTargets then
-		local targetPosition = nil
-		local actDist = 8
-
-		if nearest then
-			targetPosition = nearest.position
-			actDist = nearest.activationDistance
-		elseif #SPAWN_POINTS > 0 then
-			targetPosition = SPAWN_POINTS[currentSpawnIndex]
-			if (rootPart.Position - targetPosition).Magnitude < 12 then
-				currentSpawnIndex += 1
-				if currentSpawnIndex > #SPAWN_POINTS then
-					currentSpawnIndex = 1
-					emptySpawnLaps += 1
-					if emptySpawnLaps >= 3 then
-						statusLabel.Text = "Сервер пуст. Смена сервера требует серверного обработчика."
-						return
-					end
-				end
-				targetPosition = SPAWN_POINTS[currentSpawnIndex]
-			end
-		end
-
-		local function moveTo(position, blockedTarget)
-			if not scanning or currentRootPart ~= rootPart then
-				return false, false
-			end
-
-			local distance = (rootPart.Position - position).Magnitude
-			local duration = distance / currentSpeed
-			local timeoutAt = os.clock() + duration + 2
-			local tween = TweenService:Create(
-				rootPart,
-				TweenInfo.new(duration, Enum.EasingStyle.Linear),
-				{ CFrame = CFrame.new(position) }
-			)
-			local finished = false
-			local playbackState = nil
-			local completedConnection = tween.Completed:Connect(function(state)
-				playbackState = state
-				finished = true
-			end)
-
-			activeTween = tween
-			tween:Play()
-
-			while not finished
-				and scanning
-				and activeTween == tween
-				and currentRootPart == rootPart
-				and os.clock() < timeoutAt do
-				task.wait(0.05)
-			end
-
-			local timedOut = not finished
-				and scanning
-				and activeTween == tween
-				and currentRootPart == rootPart
-				and os.clock() >= timeoutAt
-
-			if not finished then
-				tween:Cancel()
-				playbackState = Enum.PlaybackState.Cancelled
-			end
-			completedConnection:Disconnect()
-
-			if activeTween == tween then
-				activeTween = nil
-			end
-
-			if finished
-				and playbackState == Enum.PlaybackState.Completed
-				and (rootPart.Position - position).Magnitude > 1.5 then
-				timedOut = true
-			end
-
-			if timedOut and blockedTarget and blockedTarget:IsDescendantOf(Workspace) then
-				targetBlacklist[blockedTarget] = os.clock() + TARGET_BLACKLIST_DURATION
-				statusLabel.Text = "Цель недоступна. Пропускаю её на 30 секунд."
-			end
-
-			return scanning and playbackState == Enum.PlaybackState.Completed and not timedOut, timedOut
-		end
-
-		local function getCurrentTargetState(adornee)
-			if not adornee or not adornee:IsDescendantOf(Workspace) then
-				return nil, nil
-			end
-			local prompt = getPromptData(adornee)
-			local targetObject = prompt and prompt.Parent or adornee
-			return getObjectWorldPosition(targetObject), prompt
-		end
-
-		if targetPosition then
-			if nearest then
-				local currentPosition, currentPrompt = getCurrentTargetState(nearest.adornee)
-				if not currentPosition then
-					return scanWorkspace(true)
-				end
-				targetPosition = currentPosition
-				actDist = currentPrompt and currentPrompt.MaxActivationDistance or actDist
-
-				local descentOffset = math.min(0.5, actDist * 0.25)
-				local interactionPosition = targetPosition + Vector3.new(0, descentOffset, 0)
-				local horizontalOffset = Vector3.new(
-					rootPart.Position.X - targetPosition.X,
-					0,
-					rootPart.Position.Z - targetPosition.Z
-				)
-				local distanceToInteraction = (rootPart.Position - interactionPosition).Magnitude
-				local withinActivationDistance = (rootPart.Position - targetPosition).Magnitude
-					<= math.max(0, actDist - 0.5)
-
-				if horizontalOffset.Magnitude <= 0.25
-					and distanceToInteraction <= 0.25
-					and withinActivationDistance then
-					local validatedPosition, validatedPrompt = getCurrentTargetState(nearest.adornee)
-					local validatedDistance = validatedPrompt and validatedPrompt.MaxActivationDistance or actDist
-					if validatedPosition
-						and (validatedPosition - targetPosition).Magnitude <= 2
-						and (rootPart.Position - validatedPosition).Magnitude <= math.max(0, validatedDistance - 0.5) then
-						interactWithObject(nearest.adornee, nearest.name)
-						return
-					end
-				end
-
-				local readyToDescend = false
-				for _ = 1, 4 do
-					local latestPosition, latestPrompt = getCurrentTargetState(nearest.adornee)
-					if not latestPosition then
-						return scanWorkspace(true)
-					end
-					actDist = latestPrompt and latestPrompt.MaxActivationDistance or actDist
-					targetPosition = latestPosition
-
-					local hoverPosition = targetPosition + Vector3.new(0, 4.5, 0)
-					if (rootPart.Position - hoverPosition).Magnitude > 0.25 then
-						local arrived, timedOut = moveTo(hoverPosition, nearest.adornee)
-						if timedOut then
-							return scanWorkspace(true)
-						end
-						if not arrived then
-							return
-						end
-					else
-						local beforeDescent, beforePrompt = getCurrentTargetState(nearest.adornee)
-						if not beforeDescent then
-							return scanWorkspace(true)
-						end
-						actDist = beforePrompt and beforePrompt.MaxActivationDistance or actDist
-						if (beforeDescent - targetPosition).Magnitude <= 2 then
-							targetPosition = beforeDescent
-							readyToDescend = true
-							break
-						end
-						targetPosition = beforeDescent
-					end
-				end
-
-				if not readyToDescend then
-					return
-				end
-
-				local beforeDescent, beforePrompt = getCurrentTargetState(nearest.adornee)
-				if not beforeDescent then
-					return scanWorkspace(true)
-				end
-				actDist = beforePrompt and beforePrompt.MaxActivationDistance or actDist
-				if (beforeDescent - targetPosition).Magnitude > 2 then
-					local correctedHover = beforeDescent + Vector3.new(0, 4.5, 0)
-					local arrived, timedOut = moveTo(correctedHover, nearest.adornee)
-					if timedOut then
-						return scanWorkspace(true)
-					end
-					if not arrived then
-						return
-					end
-					return
-				end
-
-				targetPosition = beforeDescent
-				descentOffset = math.min(0.5, actDist * 0.25)
-				interactionPosition = targetPosition + Vector3.new(0, descentOffset, 0)
-				local arrived, timedOut = moveTo(interactionPosition, nearest.adornee)
-				if timedOut then
-					return scanWorkspace(true)
-				end
-				if arrived then
-					local finalPosition, finalPrompt = getCurrentTargetState(nearest.adornee)
-					local finalActivationDistance = finalPrompt and finalPrompt.MaxActivationDistance or actDist
-					if finalPosition
-						and (finalPosition - targetPosition).Magnitude <= 2
-						and (rootPart.Position - finalPosition).Magnitude <= math.max(0, finalActivationDistance - 0.5) then
-						interactWithObject(nearest.adornee, nearest.name)
-					end
-				end
-			else
-				moveTo(targetPosition)
-			end
-		end
-	end
-end
-
-local function cancelCurrentAction()
-	if activeTween then
-		activeTween:Cancel()
-		activeTween = nil
-	end
-	if activePrompt then
-		pcall(function()
-			activePrompt:InputHoldEnd()
-		end)
-		activePrompt = nil
-	end
-end
-
-startScanLoop = function()
-	local thisGeneration = scanGeneration
-	task.spawn(function()
-		while scanning and scanGeneration == thisGeneration and screenGui.Parent do
-			local ok, scanError = pcall(scanWorkspace, true)
-			if not ok then
-				warn("[StudioItemFinder] Ошибка сканирования: " .. tostring(scanError))
-				stopAutomation("Ошибка сканирования: " .. tostring(scanError))
-				break
-			end
-			if scanning and emptySpawnLaps >= 3 then
-				stopAutomation("Сервер пуст. Смена сервера требует серверного обработчика.")
-				break
-			end
-			task.wait(SCAN_INTERVAL)
-		end
-	end)
+for index, targetName in ipairs(TARGET_NAMES) do
+	local button = create("TextButton", {
+		Name = "Filter_" .. string.gsub(targetName, "%W", ""),
+		Position = UDim2.fromOffset(6, 6 + (index - 1) * 26),
+		Size = UDim2.new(1, -18, 0, 22),
+		BackgroundColor3 = Color3.fromRGB(47, 83, 66),
+		BorderSizePixel = 0,
+		Font = Enum.Font.Gotham,
+		Text = "",
+		TextColor3 = Color3.fromRGB(237, 240, 246),
+		TextSize = 10,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+	}, filterScroll)
+	create("UICorner", { CornerRadius = UDim.new(0, 5) }, button)
+	filterButtons[targetName] = button
 end
 
 local function updateFilterButton(targetName)
@@ -922,130 +502,202 @@ local function updateFilterButton(targetName)
 	local enabled = TARGET_ENABLED[targetName]
 	button.Text = (enabled and "[✓] " or "[ ] ") .. targetName
 	button.BackgroundColor3 = enabled
-		and Color3.fromRGB(54, 93, 70)
-		or Color3.fromRGB(48, 51, 60)
+		and Color3.fromRGB(47, 83, 66)
+		or Color3.fromRGB(48, 52, 62)
 end
 
-local function refreshAfterFilterChange()
-	emptySpawnLaps = 0
-	local hasEnabledTargets = false
-	for _, targetName in ipairs(TARGET_NAMES) do
-		if TARGET_ENABLED[targetName] then
-			hasEnabledTargets = true
-			break
-		end
-	end
-	if not hasEnabledTargets then
-		clearResults()
-		updateHighlight(nil)
-		statusLabel.Text = "Все фильтры выключены. Включите хотя бы один предмет."
-	end
+for _, targetName in ipairs(TARGET_NAMES) do
+	updateFilterButton(targetName)
+end
 
+local function setAllFilters(enabled)
+	for _, targetName in ipairs(TARGET_NAMES) do
+		TARGET_ENABLED[targetName] = enabled
+		updateFilterButton(targetName)
+	end
 	if scanning then
 		scanGeneration += 1
 		cancelCurrentAction()
-		startScanLoop()
-	else
-		local ok, scanError = pcall(scanWorkspace, false)
-		if not ok then
-			warn("[StudioItemFinder] Ошибка сканирования: " .. tostring(scanError))
-			statusLabel.Text = "Ошибка сканирования: " .. tostring(scanError)
+		if startScanLoop then
+			startScanLoop(scanGeneration)
 		end
+	elseif not enabled then
+		for _, row in ipairs(resultRows) do
+			row.Visible = false
+		end
+		statusLabel.Text = "Все фильтры выключены."
 	end
-end
-
-for targetName, button in pairs(filterButtons) do
-	button.Activated:Connect(function()
-		TARGET_ENABLED[targetName] = not TARGET_ENABLED[targetName]
-		updateFilterButton(targetName)
-		refreshAfterFilterChange()
-	end)
 end
 
 enableAllButton.Activated:Connect(function()
-	for _, targetName in ipairs(TARGET_NAMES) do
-		TARGET_ENABLED[targetName] = true
-		updateFilterButton(targetName)
-	end
-	refreshAfterFilterChange()
+	setAllFilters(true)
 end)
-
 disableAllButton.Activated:Connect(function()
-	for _, targetName in ipairs(TARGET_NAMES) do
-		TARGET_ENABLED[targetName] = false
-		updateFilterButton(targetName)
-	end
-	refreshAfterFilterChange()
+	setAllFilters(false)
 end)
 
-local function updateCharacterReferences(character)
-	scanGeneration += 1
-	cancelCurrentAction()
-	currentCharacter = character
-	currentRootPart = nil
+local dragging = false
+local dragStart
+local panelStart
+titleLabel.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1
+		or input.UserInputType == Enum.UserInputType.Touch then
+		dragging = true
+		dragStart = input.Position
+		panelStart = frame.Position
+	end
+end)
 
-	task.spawn(function()
-		local rootPart = character:WaitForChild("HumanoidRootPart")
-		if player.Character ~= character or currentCharacter ~= character then
-			return
-		end
-		currentRootPart = rootPart
-		if scanning then
-			startScanLoop()
-		end
-	end)
+local speedDragging = false
+local function updateSpeed(input)
+	local width = math.max(1, sliderTrack.AbsoluteSize.X)
+	local percent = math.clamp((input.Position.X - sliderTrack.AbsolutePosition.X) / width, 0, 1)
+	currentSpeed = math.clamp(
+		math.floor(MIN_SPEED + percent * (MAX_SPEED - MIN_SPEED) + 0.5),
+		MIN_SPEED,
+		MAX_SPEED
+	)
+	sliderFill.Size = UDim2.new(percent, 0, 1, 0)
+	speedLabel.Text = "Скорость полёта: " .. currentSpeed .. " studs/s"
 end
 
-characterReferenceAddedConnection = player.CharacterAdded:Connect(updateCharacterReferences)
-characterReferenceRemovingConnection = player.CharacterRemoving:Connect(function(character)
-	if currentCharacter ~= character then
+sliderTrack.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1
+		or input.UserInputType == Enum.UserInputType.Touch then
+		speedDragging = true
+		updateSpeed(input)
+	end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+	if speedDragging
+		and (input.UserInputType == Enum.UserInputType.MouseMovement
+			or input.UserInputType == Enum.UserInputType.Touch) then
+		updateSpeed(input)
+	end
+	if dragging
+		and (input.UserInputType == Enum.UserInputType.MouseMovement
+			or input.UserInputType == Enum.UserInputType.Touch) then
+		local delta = input.Position - dragStart
+		frame.Position = UDim2.new(
+			panelStart.X.Scale,
+			panelStart.X.Offset + delta.X,
+			panelStart.Y.Scale,
+			panelStart.Y.Offset + delta.Y
+		)
+	end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1
+		or input.UserInputType == Enum.UserInputType.Touch then
+		speedDragging = false
+		dragging = false
+	end
+end)
+
+local expandedSize = frame.Size
+local collapsed = false
+local collapseTween
+local function setCollapsed(value)
+	collapsed = value
+	collapseButton.Text = collapsed and "+" or "−"
+	for _, child in ipairs(frame:GetChildren()) do
+		if child ~= header and child:IsA("GuiObject") then
+			child.Visible = not collapsed
+		end
+	end
+	if collapseTween then
+		collapseTween:Cancel()
+	end
+	local size = collapsed
+		and UDim2.fromOffset(expandedSize.X.Offset, 42)
+		or expandedSize
+	collapseTween = TweenService:Create(
+		frame,
+		TweenInfo.new(0.16, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+		{ Size = size }
+	)
+	collapseTween:Play()
+	frameCorner.CornerRadius = collapsed and UDim.new(0, 20) or UDim.new(0, 10)
+end
+collapseButton.Activated:Connect(function()
+	setCollapsed(not collapsed)
+end)
+
+local function restoreNoClip()
+	for part, oldValue in pairs(originalCollisions) do
+		if part.Parent then
+			part.CanCollide = oldValue
+		end
+		originalCollisions[part] = nil
+	end
+end
+
+local function getUprightCFrame(rootPart, position)
+	local look = rootPart.CFrame.LookVector
+	local horizontalLook = Vector3.new(look.X, 0, look.Z)
+	if horizontalLook.Magnitude < 0.001 then
+		horizontalLook = Vector3.new(0, 0, -1)
+	else
+		horizontalLook = horizontalLook.Unit
+	end
+	return CFrame.lookAt(position, position + horizontalLook, Vector3.yAxis)
+end
+
+local function setCharacterUpright(character, enabled)
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if not humanoid then
 		return
 	end
-	scanGeneration += 1
-	cancelCurrentAction()
-	currentCharacter = nil
-	currentRootPart = nil
-end)
-
-if player.Character then
-	updateCharacterReferences(player.Character)
-end
-
-local noClipEnabled = false
-local originalCanCollide = {}
-local characterAddedConnection = nil
-local descendantAddedConnection = nil
-
-local function restoreNoClipCollisions()
-	for part, canCollide in pairs(originalCanCollide) do
-		if part.Parent then
-			part.CanCollide = canCollide
+	if enabled then
+		if originalAutoRotate[humanoid] == nil then
+			originalAutoRotate[humanoid] = humanoid.AutoRotate
+		end
+		humanoid.AutoRotate = false
+		local rootPart = character:FindFirstChild("HumanoidRootPart")
+		if rootPart then
+			rootPart.CFrame = getUprightCFrame(rootPart, rootPart.Position)
+		end
+	else
+		local oldValue = originalAutoRotate[humanoid]
+		if oldValue ~= nil then
+			humanoid.AutoRotate = oldValue
+			originalAutoRotate[humanoid] = nil
 		end
 	end
-	table.clear(originalCanCollide)
 end
 
-local function applyNoClip(character)
-	if descendantAddedConnection then
-		descendantAddedConnection:Disconnect()
-		descendantAddedConnection = nil
+local function restoreAutoRotate()
+	for humanoid, oldValue in pairs(originalAutoRotate) do
+		if humanoid.Parent then
+			humanoid.AutoRotate = oldValue
+		end
+		originalAutoRotate[humanoid] = nil
 	end
-	restoreNoClipCollisions()
+end
+
+local function applyNoClipToCharacter(character)
+	if noClipDescendantConnection then
+		noClipDescendantConnection:Disconnect()
+		noClipDescendantConnection = nil
+	end
+	restoreNoClip()
+	setCharacterUpright(character, true)
 
 	local function disableCollision(instance)
-		if not instance:IsA("BasePart") then
-			return
+		if instance:IsA("BasePart") then
+			if originalCollisions[instance] == nil then
+				originalCollisions[instance] = instance.CanCollide
+			end
+			instance.CanCollide = false
 		end
-		if originalCanCollide[instance] == nil then
-			originalCanCollide[instance] = instance.CanCollide
-		end
-		instance.CanCollide = false
 	end
 
 	for _, instance in ipairs(character:GetDescendants()) do
 		disableCollision(instance)
 	end
-	descendantAddedConnection = character.DescendantAdded:Connect(disableCollision)
+	noClipDescendantConnection = character.DescendantAdded:Connect(disableCollision)
 end
 
 setNoClip = function(enabled)
@@ -1056,102 +708,733 @@ setNoClip = function(enabled)
 
 	if enabled then
 		if player.Character then
-			applyNoClip(player.Character)
+			applyNoClipToCharacter(player.Character)
 		end
-		characterAddedConnection = player.CharacterAdded:Connect(function(character)
+		noClipCharacterConnection = player.CharacterAdded:Connect(function(character)
 			if noClipEnabled then
-				applyNoClip(character)
+				applyNoClipToCharacter(character)
 			end
 		end)
 	else
-		if characterAddedConnection then
-			characterAddedConnection:Disconnect()
-			characterAddedConnection = nil
+		if noClipCharacterConnection then
+			noClipCharacterConnection:Disconnect()
+			noClipCharacterConnection = nil
 		end
-		if descendantAddedConnection then
-			descendantAddedConnection:Disconnect()
-			descendantAddedConnection = nil
+		if noClipDescendantConnection then
+			noClipDescendantConnection:Disconnect()
+			noClipDescendantConnection = nil
 		end
-		restoreNoClipCollisions()
+		restoreNoClip()
+		restoreAutoRotate()
 	end
 end
 
-stopAutomation = function(message)
-	if not scanning then
-		return
+local function getCurrentRootPart()
+	local character = player.Character
+	if not character then
+		currentCharacter = nil
+		currentRootPart = nil
+		return nil
 	end
+	if currentCharacter ~= character then
+		currentCharacter = character
+		currentRootPart = character:FindFirstChild("HumanoidRootPart")
+	end
+	if not currentRootPart or currentRootPart.Parent ~= character then
+		currentRootPart = character:FindFirstChild("HumanoidRootPart")
+	end
+	return currentRootPart
+end
+
+player.CharacterAdded:Connect(function(character)
+	currentCharacter = character
+	currentRootPart = nil
+	task.spawn(function()
+		local root = character:WaitForChild("HumanoidRootPart")
+		if player.Character == character then
+			currentRootPart = root
+			if scanning then
+				statusLabel.Text = "Персонаж восстановлен · продолжаю сканирование"
+			end
+		end
+	end)
+end)
+
+player.CharacterRemoving:Connect(function(character)
+	if currentCharacter == character then
+		cancelCurrentAction()
+		setCharacterUpright(character, false)
+		currentCharacter = nil
+		currentRootPart = nil
+	end
+end)
+
+local function normalizeName(name)
+	return string.gsub(string.lower(name), "[^%w]", "")
+end
+
+local function findTargetName(objectName)
+	local normalizedObjectName = normalizeName(objectName)
+	for _, targetName in ipairs(TARGET_NAMES) do
+		local normalizedTargetName = normalizeName(targetName)
+		if normalizedTargetName ~= ""
+			and string.find(normalizedObjectName, normalizedTargetName, 1, true) then
+			return targetName
+		end
+	end
+	return nil
+end
+
+local function isPlayerCharacterAncestor(object)
+	local ancestor = object
+	while ancestor and ancestor ~= Workspace do
+		if ancestor:IsA("Model") and Players:GetPlayerFromCharacter(ancestor) then
+			return true
+		end
+		ancestor = ancestor.Parent
+	end
+	return false
+end
+
+local function getWorldPosition(object)
+	if not object then
+		return nil
+	end
+	if object:IsA("Attachment") then
+		return object.WorldPosition
+	end
+	if object:IsA("BasePart") then
+		return object.Position
+	end
+	if object:IsA("Model") then
+		local ok, pivot = pcall(function()
+			return object:GetPivot()
+		end)
+		if ok then
+			return pivot.Position
+		end
+	end
+	local part = object:FindFirstAncestorWhichIsA("BasePart")
+	if part then
+		return part.Position
+	end
+	local model = object:FindFirstAncestorOfClass("Model")
+	if model then
+		local ok, pivot = pcall(function()
+			return model:GetPivot()
+		end)
+		if ok then
+			return pivot.Position
+		end
+	end
+	return nil
+end
+
+local function findPromptTarget(prompt)
+	if not prompt or not prompt.Parent or not prompt.Enabled then
+		return nil
+	end
+	local ancestor = prompt.Parent
+	local matchedObject
+	local targetName
+	while ancestor and ancestor ~= Workspace do
+		targetName = findTargetName(ancestor.Name)
+		if targetName then
+			matchedObject = ancestor
+			break
+		end
+		ancestor = ancestor.Parent
+	end
+
+	-- В собственном Studio-проекте ObjectText помогает, если модель названа общо.
+	-- Сначала всегда проверяются имена физического объекта и его предков.
+	if not targetName then
+		targetName = findTargetName(prompt.ObjectText)
+			or findTargetName(prompt.ActionText)
+		matchedObject = prompt.Parent:FindFirstAncestorOfClass("Model") or prompt.Parent
+	end
+	if not targetName or isPlayerCharacterAncestor(prompt.Parent) then
+		return nil
+	end
+
+	local position = getWorldPosition(prompt.Parent) or getWorldPosition(matchedObject)
+	if not position then
+		return nil
+	end
+	return {
+		prompt = prompt,
+		object = matchedObject,
+		name = targetName,
+		objectName = matchedObject.Name,
+		position = position,
+		activationDistance = math.max(1, prompt.MaxActivationDistance),
+	}
+end
+
+local function findTargets(origin)
+	local results = {}
+	local seen = {}
+	local activePromptCount = 0
+	local searchCenter = lastItemPosition or patrolCenter
+	if not searchCenter and scanning then
+		patrolCenter = origin
+		searchCenter = origin
+	end
+
+	for _, instance in ipairs(Workspace:GetDescendants()) do
+		if instance:IsA("ProximityPrompt") and instance.Enabled then
+			activePromptCount += 1
+			local target = findPromptTarget(instance)
+			if target
+				and TARGET_ENABLED[target.name]
+				and (not searchCenter
+					or (target.position - searchCenter).Magnitude <= LOCAL_SEARCH_MAX_RADIUS - 5)
+				and (targetRetryAfter[target.object] or 0) <= os.clock()
+				and not seen[target.object] then
+				seen[target.object] = true
+				target.distance = (origin - target.position).Magnitude
+				table.insert(results, target)
+			end
+		end
+	end
+
+	table.sort(results, function(a, b)
+		return a.distance < b.distance
+	end)
+	return results, activePromptCount
+end
+
+local function renderResults(results)
+	for index, row in ipairs(resultRows) do
+		local result = results[index]
+		if result then
+			row.Visible = true
+			row.Text = string.format(
+				"  %s · %s · %.0f studs",
+				result.name,
+				result.objectName,
+				result.distance
+			)
+			row.BackgroundColor3 = index == 1
+				and Color3.fromRGB(46, 64, 58)
+				or Color3.fromRGB(35, 39, 48)
+		else
+			row.Visible = false
+			row.Text = ""
+		end
+	end
+end
+
+scanWorkspace = function()
+	local root = getCurrentRootPart()
+	if not root then
+		statusLabel.Text = "Ожидаю персонажа..."
+		renderResults({})
+		updateScannedHighlights({})
+		return {}
+	end
+
+	local results, activePromptCount = findTargets(root.Position)
+	renderResults(results)
+	updateScannedHighlights(results)
+	if #results == 0 then
+		statusLabel.Text = string.format(
+			"Нет совпадений · активных ProximityPrompt: %d",
+			activePromptCount
+		)
+	end
+	return results
+end
+
+local function buildLocalSearchRoute(originPosition)
+	local center = lastItemPosition or patrolCenter or originPosition
+	local raycastParams = RaycastParams.new()
+	raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+	raycastParams.FilterDescendantsInstances = { currentCharacter }
+
+	local route = {}
+	local centerRayOrigin = center + Vector3.new(0, 512, 0)
+	local centerGround = Workspace:Raycast(centerRayOrigin, Vector3.new(0, -4096, 0), raycastParams)
+	if centerGround then
+		table.insert(route, Vector3.new(
+			center.X,
+			centerGround.Position.Y + LOCAL_SEARCH_CLEARANCE,
+			center.Z
+		))
+	end
+
+	-- Обходим широкую зону кольцами; точки без поверхности под ними пропускаются,
+	-- чтобы патруль не уходил в пустоту за пределами карты.
+	for ringIndex, radius in ipairs(LOCAL_SEARCH_RADII) do
+		local angleOffset = (ringIndex - 1) * math.pi / LOCAL_SEARCH_POINTS_PER_RING
+		for pointIndex = 1, LOCAL_SEARCH_POINTS_PER_RING do
+			local angle = (pointIndex - 1) * (2 * math.pi / LOCAL_SEARCH_POINTS_PER_RING) + angleOffset
+			local x = center.X + math.cos(angle) * radius
+			local z = center.Z + math.sin(angle) * radius
+			local rayOrigin = Vector3.new(x, center.Y + 512, z)
+			local ground = Workspace:Raycast(rayOrigin, Vector3.new(0, -4096, 0), raycastParams)
+			if ground then
+				local point = Vector3.new(x, ground.Position.Y + LOCAL_SEARCH_CLEARANCE, z)
+				local offset = point - center
+				if offset.Magnitude > LOCAL_SEARCH_MAX_RADIUS then
+					point = center + offset.Unit * LOCAL_SEARCH_MAX_RADIUS
+				end
+				table.insert(route, point)
+			end
+		end
+	end
+	if #route == 0 then
+		table.insert(route, originPosition)
+	end
+
+	return route
+end
+
+local function getNextLocalSearchPoint(originPosition)
+	if #patrolRoute == 0 or patrolRouteIndex > #patrolRoute then
+		patrolRoute = buildLocalSearchRoute(originPosition)
+		for index = #patrolRoute, 2, -1 do
+			local swapIndex = routeRandom:NextInteger(1, index)
+			patrolRoute[index], patrolRoute[swapIndex] = patrolRoute[swapIndex], patrolRoute[index]
+		end
+		patrolRouteIndex = 1
+
+		-- Перемешиваем порядок перелётов и начинаем с ближайшей точки.
+		local nearestDistance = math.huge
+		for index, position in ipairs(patrolRoute) do
+			local distance = (originPosition - position).Magnitude
+			if distance < nearestDistance then
+				nearestDistance = distance
+				patrolRouteIndex = index
+			end
+		end
+	end
+
+	local index = patrolRouteIndex
+	local position = patrolRoute[index]
+	patrolRouteIndex += 1
+	return position, index, #patrolRoute
+end
+
+local function moveTo(position, generation, scanDuringTravel)
+	local root = getCurrentRootPart()
+	if not root or not scanning or generation ~= scanGeneration then
+		return false
+	end
+
+	local distance = (root.Position - position).Magnitude
+	if distance < 1 then
+		return true
+	end
+
+	local duration = math.max(0.1, distance / math.max(MIN_SPEED, currentSpeed))
+	local tween = TweenService:Create(
+		root,
+		TweenInfo.new(duration, Enum.EasingStyle.Linear),
+		{ CFrame = getUprightCFrame(root, position) }
+	)
+	activeTween = tween
+	tween:Play()
+
+	local deadline = os.clock() + duration + 2
+	local nextTravelScan = os.clock() + SCAN_INTERVAL
+	local foundTargetDuringTravel = false
+	while scanning and generation == scanGeneration and os.clock() < deadline do
+		if not root.Parent then
+			break
+		end
+		if (root.Position - position).Magnitude <= 1.25 then
+			break
+		end
+		if tween.PlaybackState ~= Enum.PlaybackState.Playing then
+			break
+		end
+		if scanDuringTravel and os.clock() >= nextTravelScan then
+			local results = scanWorkspace()
+			if #results > 0 then
+				foundTargetDuringTravel = true
+				break
+			end
+			nextTravelScan = os.clock() + SCAN_INTERVAL
+			statusLabel.Text = "Облёт карты · продолжаю поиск предметов..."
+		end
+		task.wait(0.05)
+	end
+
+	local reached = not foundTargetDuringTravel
+		and root.Parent ~= nil
+		and (root.Position - position).Magnitude <= 2.5
+	if tween.PlaybackState == Enum.PlaybackState.Playing then
+		tween:Cancel()
+	end
+	if activeTween == tween then
+		activeTween = nil
+	end
+	return reached, foundTargetDuringTravel
+end
+
+local function interactWithTarget(target, generation, attempt)
+	attempt = attempt or 1
+	local prompt = target.prompt
+	if not scanning or generation ~= scanGeneration
+		or not prompt.Parent or not prompt.Enabled then
+		return false, "invalid"
+	end
+
+	local root = getCurrentRootPart()
+	local promptPosition = getWorldPosition(prompt.Parent)
+	if not root or not promptPosition then
+		statusLabel.Text = "Не удалось определить позицию ProximityPrompt."
+		return false, "invalid"
+	end
+	local distance = (root.Position - promptPosition).Magnitude
+	local activationDistance = prompt.MaxActivationDistance
+	if activationDistance <= 0 or distance > activationDistance then
+		statusLabel.Text = string.format(
+			"Вне радиуса E: %.1f / %.1f studs",
+			distance,
+			activationDistance
+		)
+		return false, "out-of-range"
+	end
+
+	-- Даём Roblox обновить видимость prompt после последнего перемещения.
+	local visibleDeadline = os.clock() + 0.75
+	while scanning and generation == scanGeneration
+		and prompt.Parent and prompt.Enabled
+		and not visiblePrompts[prompt]
+		and os.clock() < visibleDeadline do
+		task.wait(0.05)
+	end
+	if not scanning or generation ~= scanGeneration then
+		return false, "stopped"
+	end
+	if not visiblePrompts[prompt] then
+		statusLabel.Text = "ProximityPrompt не показан · проверьте дальность и видимость."
+		return false, "not-visible"
+	end
+
+	local triggered = false
+	local holdBegan = prompt.HoldDuration <= 0
+	local holdDuration = prompt.HoldDuration
+	local triggerConnection = prompt.Triggered:Connect(function(triggeringPlayer)
+		if triggeringPlayer == nil or triggeringPlayer == player then
+			triggered = true
+			holdBegan = true
+		end
+	end)
+	local holdConnection
+	if holdDuration > 0 then
+		holdConnection = prompt.PromptButtonHoldBegan:Connect(function(triggeringPlayer)
+			if triggeringPlayer == nil or triggeringPlayer == player then
+				holdBegan = true
+			end
+		end)
+	end
+	activePromptConnection = triggerConnection
+	activePrompt = prompt
+
+	local ok, err = pcall(function()
+		prompt:InputHoldBegin()
+	end)
+	if ok then
+		local endAt = os.clock() + math.max(0.15, holdDuration + 0.25)
+		while scanning and generation == scanGeneration
+			and not triggered
+			and prompt.Parent and prompt.Enabled
+			and os.clock() < endAt do
+			task.wait(0.03)
+		end
+	end
+
+	pcall(function()
+		prompt:InputHoldEnd()
+	end)
+	if activePrompt == prompt then
+		activePrompt = nil
+	end
+	if activePromptConnection == triggerConnection then
+		activePromptConnection = nil
+	end
+	triggerConnection:Disconnect()
+	if holdConnection then
+		holdConnection:Disconnect()
+	end
+
+	if ok and prompt.Parent and prompt.Enabled
+		and target.object:IsDescendantOf(Workspace) then
+		-- Даём серверному обработчику время удалить или отключить предмет.
+		local ackDeadline = os.clock() + 2
+		while scanning and generation == scanGeneration
+			and os.clock() < ackDeadline
+			and prompt.Parent and prompt.Enabled
+			and target.object:IsDescendantOf(Workspace) do
+			task.wait(0.05)
+		end
+	end
+
+	local collected = not prompt.Parent
+		or not prompt.Enabled
+		or not target.object:IsDescendantOf(Workspace)
+	if collected then
+		sessionStats[target.name] += 1
+		updateStatsLabel()
+		statusLabel.Text = "Подобрано: " .. target.name
+		return true, "collected"
+	end
+
+	if ok and scanning and generation == scanGeneration and attempt < 2
+		and prompt.Parent and prompt.Enabled then
+		statusLabel.Text = string.format("Повторяю удержание E · %s (%d/2)", target.name, attempt + 1)
+		task.wait(0.15)
+		return interactWithTarget(target, generation, attempt + 1)
+	end
+
+	if not ok then
+		warn("[StudioItemFinder] Не удалось активировать ProximityPrompt: " .. tostring(err))
+	end
+	if triggered then
+		statusLabel.Text = "E сработала, но предмет остался · проверьте серверный подбор."
+	elseif not holdBegan then
+		statusLabel.Text = "Roblox не начал удержание E: " .. target.name
+	else
+		statusLabel.Text = "Подбор не подтвердился: " .. target.name
+	end
+	return false, "failed"
+end
+
+local function moveAndCollect(target, generation)
+	local hoverPosition = target.position + Vector3.new(0, 4.5, 0)
+	if not moveTo(hoverPosition, generation) then
+		return false
+	end
+	if not scanning or generation ~= scanGeneration then
+		return false
+	end
+
+	local currentTarget = findPromptTarget(target.prompt)
+	if not currentTarget then
+		return false
+	end
+	if (currentTarget.position - target.position).Magnitude > 2 then
+		target = currentTarget
+		hoverPosition = target.position + Vector3.new(0, 4.5, 0)
+		if not moveTo(hoverPosition, generation) then
+			return false
+		end
+	end
+
+	local lateralDirections = {
+		Vector3.zero,
+		Vector3.new(1, 0, 0),
+		Vector3.new(-1, 0, 0),
+		Vector3.new(0, 0, 1),
+		Vector3.new(0, 0, -1),
+	}
+
+	for _, direction in ipairs(lateralDirections) do
+		if not scanning or generation ~= scanGeneration then
+			return false
+		end
+		local liveTarget = findPromptTarget(target.prompt)
+		if not liveTarget then
+			return false
+		end
+		if (liveTarget.position - target.position).Magnitude > 2 then
+			target = liveTarget
+		else
+			target = liveTarget
+		end
+
+		local descentHeight = math.clamp(target.activationDistance * 0.25, 0.35, 1.5)
+		local lateralDistance = math.clamp(target.activationDistance * 0.2, 0.2, 1.25)
+		local approachPosition = target.position
+			+ Vector3.new(0, descentHeight, 0)
+			+ direction * lateralDistance
+		if not moveTo(approachPosition, generation) then
+			return false
+		end
+
+		liveTarget = findPromptTarget(target.prompt)
+		if liveTarget then
+			if (liveTarget.position - target.position).Magnitude > 2 then
+				target = liveTarget
+				descentHeight = math.clamp(target.activationDistance * 0.25, 0.35, 1.5)
+				approachPosition = target.position
+					+ Vector3.new(0, descentHeight, 0)
+					+ direction * lateralDistance
+				if not moveTo(approachPosition, generation) then
+					return false
+				end
+				liveTarget = findPromptTarget(target.prompt)
+			end
+			if liveTarget then
+				local collected, reason = interactWithTarget(liveTarget, generation)
+				if collected then
+					return true
+				end
+				if reason ~= "not-visible" and reason ~= "out-of-range" then
+					return false
+				end
+				target = liveTarget
+			end
+		end
+	end
+	return false
+end
+
+local function hasEnabledTargets()
+	for _, targetName in ipairs(TARGET_NAMES) do
+		if TARGET_ENABLED[targetName] then
+			return true
+		end
+	end
+	return false
+end
+
+local function stopAutomation(message)
 	scanning = false
 	scanGeneration += 1
-	setNoClip(false)
 	cancelCurrentAction()
-	toggleButton.Text = "Авто-сбор: выкл"
-	toggleButton.BackgroundColor3 = Color3.fromRGB(60, 110, 78)
+	if setNoClip then
+		pcall(setNoClip, false)
+	end
+	updateScannedHighlights({})
+	updateToggleVisual()
 	statusLabel.Text = message
-	updateHighlight(nil)
 end
+
+startScanLoop = function(generation)
+	task.spawn(function()
+		while scanning and generation == scanGeneration and screenGui.Parent do
+			local ok, scanError = pcall(function()
+				local results = scanWorkspace()
+				if not scanning or generation ~= scanGeneration then
+					return
+				end
+
+				if #results > 0 then
+					local target = results[1]
+					lastItemPosition = target.position
+					patrolRoute = {}
+					patrolRouteIndex = 1
+					statusLabel.Text = string.format(
+						"Найдено: %d · цель: %s",
+						#results,
+						target.name
+					)
+					local activated = moveAndCollect(target, generation)
+					targetRetryAfter[target.object] = os.clock() + (activated and 2 or 5)
+				elseif not hasEnabledTargets() then
+					statusLabel.Text = "Все фильтры выключены."
+				else
+					local root = getCurrentRootPart()
+					if root then
+						local searchPoint, pointIndex, pointCount = getNextLocalSearchPoint(root.Position)
+						statusLabel.Text = string.format(
+			"Предметов нет · круговой поиск %d/%d (до 1500 studs)",
+							pointIndex,
+							pointCount
+						)
+						moveTo(searchPoint, generation, true)
+					end
+				end
+			end)
+			if not ok then
+				warn("[StudioItemFinder] Ошибка цикла сканирования: " .. tostring(scanError))
+				stopAutomation("Ошибка сканирования: " .. tostring(scanError))
+				break
+			end
+			task.wait(SCAN_INTERVAL)
+		end
+	end)
+end
+
+toggleAutomation = function()
+	scanning = not scanning
+	scanGeneration += 1
+	local generation = scanGeneration
+	updateToggleVisual()
+
+	if scanning then
+		local root = getCurrentRootPart()
+		patrolCenter = root and root.Position or nil
+		lastItemPosition = nil
+		patrolRoute = {}
+		patrolRouteIndex = 1
+		if not hasEnabledTargets() then
+			for _, targetName in ipairs(TARGET_NAMES) do
+				TARGET_ENABLED[targetName] = true
+				updateFilterButton(targetName)
+			end
+		end
+
+		statusLabel.Text = "Запускаю сканирование..."
+		task.defer(function()
+			if not scanning or generation ~= scanGeneration then
+				return
+			end
+			local noClipOk, noClipError = pcall(setNoClip, true)
+			if not noClipOk then
+				warn("[StudioItemFinder] Ошибка noclip: " .. tostring(noClipError))
+			end
+			if startScanLoop then
+				startScanLoop(generation)
+			else
+				scanning = false
+				scanGeneration += 1
+				updateToggleVisual()
+				statusLabel.Text = "Сканер не инициализирован."
+			end
+		end)
+	else
+		patrolRoute = {}
+		patrolRouteIndex = 1
+		patrolCenter = nil
+		cancelCurrentAction()
+		if setNoClip then
+			pcall(setNoClip, false)
+		end
+		statusLabel.Text = "Авто-сбор остановлен."
+		renderResults({})
+		updateScannedHighlights({})
+	end
+end
+
+for _, targetName in ipairs(TARGET_NAMES) do
+	local button = filterButtons[targetName]
+	button.Activated:Connect(function()
+		TARGET_ENABLED[targetName] = not TARGET_ENABLED[targetName]
+		updateFilterButton(targetName)
+		if scanning then
+			scanGeneration += 1
+			cancelCurrentAction()
+			startScanLoop(scanGeneration)
+		elseif not TARGET_ENABLED[targetName] then
+			statusLabel.Text = "Фильтр изменён · включите авто-сбор для поиска"
+		end
+	end)
+end
+
+player.CharacterRemoving:Connect(function(character)
+	if currentCharacter == character then
+		cancelCurrentAction()
+		currentRootPart = nil
+	end
+end)
 
 script.Destroying:Connect(function()
 	scanning = false
 	scanGeneration += 1
 	cancelCurrentAction()
-	setNoClip(false)
-
-	if inputChangedConnection then
-		inputChangedConnection:Disconnect()
-		inputChangedConnection = nil
+	if setNoClip then
+		pcall(setNoClip, false)
 	end
-	if inputEndedConnection then
-		inputEndedConnection:Disconnect()
-		inputEndedConnection = nil
-	end
-	if characterReferenceAddedConnection then
-		characterReferenceAddedConnection:Disconnect()
-		characterReferenceAddedConnection = nil
-	end
-	if characterReferenceRemovingConnection then
-		characterReferenceRemovingConnection:Disconnect()
-		characterReferenceRemovingConnection = nil
-	end
+	updateScannedHighlights({})
 	if collapseTween then
 		collapseTween:Cancel()
-		collapseTween = nil
-	end
-	if currentHighlight then
-		currentHighlight:Destroy()
-		currentHighlight = nil
 	end
 	if screenGui.Parent then
 		screenGui:Destroy()
 	end
 end)
-refreshButton.Activated:Connect(function()
-	local ok, scanError = pcall(scanWorkspace, false)
-	if not ok then
-		warn("[StudioItemFinder] Ошибка сканирования: " .. tostring(scanError))
-		statusLabel.Text = "Ошибка сканирования: " .. tostring(scanError)
-	end
-end)
-
-toggleButton.Activated:Connect(function()
-	scanning = not scanning
-	if scanning then
-		emptySpawnLaps = 0
-	end
-	setNoClip(scanning)
-	scanGeneration += 1
-	toggleButton.Text = scanning and "Авто-сбор: вкл" or "Авто-сбор: выкл"
-	toggleButton.BackgroundColor3 = scanning
-		and Color3.fromRGB(130, 91, 49)
-		or Color3.fromRGB(60, 110, 78)
-
-	if scanning then
-		statusLabel.Text = "Сканирование запущено..."
-		startScanLoop()
-	else
-		cancelCurrentAction()
-		statusLabel.Text = "Автоматизация остановлена."
-		updateHighlight(nil)
-	end
-end)
-
-
