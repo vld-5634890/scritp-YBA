@@ -3,9 +3,6 @@
 -- Скрипт намеренно работает только в Studio.
 
 local RunService = game:GetService("RunService")
-if not RunService:IsStudio() then
-	return
-end
 
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
