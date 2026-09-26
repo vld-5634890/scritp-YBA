@@ -1,7 +1,3 @@
--- Отладочный поиск предметов для собственного проекта в Roblox Studio.
--- Поместите этот LocalScript в StarterPlayer > StarterPlayerScripts.
-
-local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local TweenService = game:GetService("TweenService")
@@ -24,6 +20,12 @@ local TARGET_NAMES = {
 	"Headband",
 	"Steel Ball",
 }
+
+local sessionStats = {}
+local countedObjects = setmetatable({}, { __mode = "k" })
+for _, targetName in ipairs(TARGET_NAMES) do
+	sessionStats[targetName] = 0
+end
 
 local TARGET_ENABLED = {
 	["Pure Rokakaka"] = true,
@@ -88,7 +90,7 @@ local frame = create("Frame", {
 	Name = "Panel",
 	AnchorPoint = Vector2.new(0, 0.5),
 	Position = UDim2.new(0, 20, 0.5, 0),
-	Size = UDim2.fromOffset(300, 520),
+	Size = UDim2.fromOffset(300, 580),
 	BackgroundColor3 = Color3.fromRGB(28, 30, 36),
 	BorderSizePixel = 0,
 }, screenGui)
@@ -227,7 +229,7 @@ local statusLabel = create("TextLabel", {
 local resultsFrame = create("ScrollingFrame", {
 	Name = "Results",
 	Position = UDim2.fromOffset(12, 168),
-	Size = UDim2.new(1, -24, 1, -340),
+	Size = UDim2.new(1, -24, 1, -400),
 	BackgroundColor3 = Color3.fromRGB(21, 23, 28),
 	BorderSizePixel = 0,
 	CanvasSize = UDim2.new(),
@@ -235,9 +237,42 @@ local resultsFrame = create("ScrollingFrame", {
 }, frame)
 create("UICorner", { CornerRadius = UDim.new(0, 6) }, resultsFrame)
 
+local statsLabel = create("TextLabel", {
+	Name = "SessionStats",
+	Position = UDim2.fromOffset(12, 358),
+	Size = UDim2.new(1, -24, 0, 54),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.Gotham,
+	Text = "",
+	TextColor3 = Color3.fromRGB(200, 204, 215),
+	TextSize = 9,
+	TextWrapped = true,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextYAlignment = Enum.TextYAlignment.Top,
+}, frame)
+
+local function updateStatsLabel()
+	local collected = {}
+
+	for _, targetName in ipairs(TARGET_NAMES) do
+		local count = sessionStats[targetName] or 0
+		if count > 0 then
+			table.insert(collected, string.format("%s ×%d", targetName, count))
+		end
+	end
+
+	if #collected == 0 then
+		statsLabel.Text = "Собрано за сессию: пока ничего"
+	else
+		statsLabel.Text = "Собрано за сессию: " .. table.concat(collected, " · ")
+	end
+end
+
+updateStatsLabel()
+
 local filterScrollingFrame = create("ScrollingFrame", {
 	Name = "FilterScrollingFrame",
-	Position = UDim2.fromOffset(12, 358),
+	Position = UDim2.fromOffset(12, 418),
 	Size = UDim2.new(1, -24, 0, 150),
 	BackgroundTransparency = 1,
 	BorderSizePixel = 0,
@@ -452,7 +487,7 @@ local function updateHighlight(adornee)
 	currentHighlight.Adornee = adornee
 end
 
-local function interactWithObject(object)
+local function interactWithObject(object, detectedTargetName)
 	local prompt = getPromptData(object)
 	if prompt and prompt.Enabled then
 		activePrompt = prompt
@@ -463,6 +498,16 @@ local function interactWithObject(object)
 			task.wait(prompt.HoldDuration + 0.05)
 			if activePrompt == prompt then
 				prompt:InputHoldEnd()
+
+				local targetName = findTargetName(detectedTargetName or "")
+					or findTargetName(object.Name)
+				if targetName
+					and sessionStats[targetName] ~= nil
+					and not countedObjects[object] then
+					countedObjects[object] = true
+					sessionStats[targetName] += 1
+					updateStatsLabel()
+				end
 			end
 		end
 		activePrompt = nil
@@ -667,7 +712,7 @@ local function scanWorkspace(allowMovement)
 					if validatedPosition
 						and (validatedPosition - targetPosition).Magnitude <= 2
 						and (rootPart.Position - validatedPosition).Magnitude <= math.max(0, validatedDistance - 0.5) then
-						interactWithObject(nearest.adornee)
+						interactWithObject(nearest.adornee, nearest.name)
 						return
 					end
 				end
@@ -739,7 +784,7 @@ local function scanWorkspace(allowMovement)
 					if finalPosition
 						and (finalPosition - targetPosition).Magnitude <= 2
 						and (rootPart.Position - finalPosition).Magnitude <= math.max(0, finalActivationDistance - 0.5) then
-						interactWithObject(nearest.adornee)
+						interactWithObject(nearest.adornee, nearest.name)
 					end
 				end
 			else
