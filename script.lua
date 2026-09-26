@@ -9,7 +9,6 @@ end
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local TweenService = game:GetService("TweenService")
-local VirtualInputManager = game:GetService("VirtualInputManager")
 
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
@@ -21,7 +20,6 @@ local TARGET_NAMES = {
 	"Rokakaka",
 }
 
--- Координаты точек спавна для облёта и прогрузки карты, если предметов нет
 local SPAWN_POINTS = {
 	Vector3.new(100, 10, 100),
 	Vector3.new(-200, 15, 300),
@@ -33,8 +31,10 @@ local SCAN_INTERVAL = 1
 local scanning = false
 local scanGeneration = 0
 local currentHighlight = nil
-local currentSpeed = 25 -- Дефолтная скорость перемещения
+local currentSpeed = 25
 local currentSpawnIndex = 1
+local activeTween = nil
+local activePrompt = nil -- Для исправления бага с удержанием кнопки при выключении
 
 local function create(className, properties, parent)
 	local instance = Instance.new(className)
@@ -51,7 +51,6 @@ local screenGui = create("ScreenGui", {
 	IgnoreGuiInset = true,
 }, playerGui)
 
--- Изменили высоту панели до 370, чтобы поместился слайдер скорости
 local frame = create("Frame", {
 	Name = "Panel",
 	AnchorPoint = Vector2.new(0, 0.5),
@@ -100,7 +99,6 @@ local toggleButton = create("TextButton", {
 }, frame)
 create("UICorner", { CornerRadius = UDim.new(0, 6) }, toggleButton)
 
--- Слайдер скорости (Контейнер)
 local sliderFrame = create("Frame", {
 	Name = "SliderFrame",
 	Position = UDim2.fromOffset(12, 88),
@@ -132,7 +130,7 @@ local sliderBtn = create("TextButton", {
 
 local sliderFill = create("Frame", {
 	Name = "Fill",
-	Size = UDim2.new(0.44, 0, 1, 0), -- По умолчанию 25 studs/s
+	Size = UDim2.new(0.44, 0, 1, 0),
 	BackgroundColor3 = Color3.fromRGB(100, 150, 240),
 	BorderSizePixel = 0,
 }, sliderBtn)
@@ -175,7 +173,6 @@ listLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
 	resultsFrame.CanvasSize = UDim2.new(0, 0, 0, listLayout.AbsoluteContentSize.Y + 12)
 end)
 
--- Логика движения ползунка скорости (от 5 до 50)
 local holdingSlider = false
 local function updateSlider(input)
 	local percentage = math.clamp((input.Position.X - sliderBtn.AbsolutePosition.X) / sliderBtn.AbsoluteSize.X, 0, 1)
@@ -229,13 +226,26 @@ local function getHighlightAdornee(object)
 	return nil
 end
 
-local function getPosition(object)
+-- Исправление бага с Attachment: корректно определяем мировую позицию для любых объектов
+local function getObjectWorldPosition(object)
 	if object:IsA("BasePart") then
 		return object.Position
+	elseif object:IsA("Attachment") then
+		return object.WorldPosition
 	elseif object:IsA("Model") then
 		return object:GetPivot().Position
 	end
 	return nil
+end
+
+local function getPromptData(object)
+	local prompt = object:FindFirstChildOfClass("ProximityPrompt") or (object.Parent and object.Parent:FindFirstChildOfClass("ProximityPrompt"))
+	if not prompt then
+		for _, desc in ipairs(object:GetDescendants()) do
+			if desc:IsA("ProximityPrompt") then prompt = desc break end
+		end
+	end
+	return prompt
 end
 
 local function clearResults()
@@ -259,30 +269,24 @@ local function updateHighlight(adornee)
 	currentHighlight.Adornee = adornee
 end
 
--- Sub-функция автоматического взаимодействия с ProximityPrompt (подбор на кнопку E)
 local function interactWithObject(object)
-	local prompt = object:FindFirstChildOfClass("ProximityPrompt") or object.Parent:FindFirstChildOfClass("ProximityPrompt")
-	if not prompt then
-		for _, desc in ipairs(object:GetDescendants()) do
-			if desc:IsA("ProximityPrompt") then
-				prompt = desc
-				break
+	local prompt = getPromptData(object)
+	if prompt and prompt.Enabled then
+		activePrompt = prompt
+		statusLabel.Text = "Активация взаимодействия..."
+		task.wait(0.1)
+		if scanning and activePrompt == prompt then
+			prompt:InputHoldBegin()
+			task.wait(prompt.HoldDuration + 0.05)
+			if activePrompt == prompt then
+				prompt:InputHoldEnd()
 			end
 		end
-	end
-
-	if prompt and prompt.Enabled then
-		statusLabel.Text = "Появилось окно. Зажимаю [E]..."
-		task.wait(0.1)
-		VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.E, false, game)
-		task.wait(prompt.HoldDuration + 0.1)
-		VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game)
-		prompt:InputHoldEnd()
+		activePrompt = nil
 	end
 end
 
--- Модифицированная функция сканирования, которая теперь управляет полетом игрока
-local function scanWorkspace()
+local function scanWorkspace(allowMovement)
 	clearResults()
 
 	local character = player.Character
@@ -298,15 +302,24 @@ local function scanWorkspace()
 			local adornee = getHighlightAdornee(object)
 			if adornee and not foundByObject[adornee] then
 				foundByObject[adornee] = true
-				local position = getPosition(adornee)
-				local distance = position and (rootPart.Position - position).Magnitude or nil
-				table.insert(results, {
-					adornee = adornee,
-					distance = distance,
-					name = targetName,
-					objectName = adornee.Name,
-					position = position,
-				})
+				
+				local prompt = getPromptData(adornee)
+				local targetObject = prompt and prompt.Parent or adornee
+				local position = getObjectWorldPosition(targetObject)
+				
+				if position then
+					local distance = (rootPart.Position - position).Magnitude
+					local actDistance = prompt and prompt.MaxActivationDistance or 8
+					
+					table.insert(results, {
+						adornee = adornee,
+						distance = distance,
+						name = targetName,
+						objectName = adornee.Name,
+						position = position,
+						activationDistance = actDistance
+					})
+				end
 			end
 		end
 	end
@@ -321,59 +334,77 @@ local function scanWorkspace()
 	local nearest = results[1]
 	updateHighlight(nearest and nearest.adornee or nil)
 
-	-- Вывод списка найденного в GUI
 	if #results == 0 then
-		statusLabel.Text = "Предметы не найдены. Лечу на спавн..."
+		statusLabel.Text = (scanning and allowMovement ~= false) and "Предметы не найдены. Перехожу к точкам сканирования..." or "Предметы не найдены."
 	else
 		statusLabel.Text = string.format("Найдено: %d · лечу к ближайшему", #results)
 	end
 
+	-- Исправление бага с сортировкой списка: жестко задаем LayoutOrder = index
 	for index, result in ipairs(results) do
 		local distanceText = result.distance and string.format("%.0f studs", result.distance) or "неизвестно"
 		create("TextLabel", {
 			Name = "Result" .. index,
+			LayoutOrder = index,
 			Size = UDim2.new(1, -4, 0, 34),
+			BackgroundColor3 = index == 1 and Color3.fromRGB(56, 52, 39) or Color3.fromRGB(34, 36, 43),
+			BorderSizePixel = 0,
+			Font = Enum.Font.Gotham,
+			Text = string.format("%s · %s · %s", result.name, result.objectName, distanceText),
+			TextColor3 = Color3.fromRGB(232, 234, 240),
+			TextSize = 11,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+			TextXAlignment = Enum.TextXAlignment.Left,
+		}, resultsFrame)
 	end
 
-	-- Логика перелёта
-	if scanning then
+	if scanning and allowMovement ~= false then
 		local targetPosition = nil
-		
+		local actDist = 8
+
 		if nearest then
 			targetPosition = nearest.position
-		else
-			-- Если предметов на карте нет — летаем по точкам спавна для прогрузки
-			if #SPAWN_POINTS > 0 then
-				targetPosition = SPAWN_POINTS[currentSpawnIndex]
-				if (rootPart.Position - targetPosition).Magnitude < 12 then
-					currentSpawnIndex = currentSpawnIndex + 1
-					if currentSpawnIndex > #SPAWN_POINTS then
-						currentSpawnIndex = 1
-					end
-					targetPosition = SPAWN_POINTS[currentSpawnIndex]
+			actDist = nearest.activationDistance
+		elseif #SPAWN_POINTS > 0 then
+			targetPosition = SPAWN_POINTS[currentSpawnIndex]
+			if (rootPart.Position - targetPosition).Magnitude < 12 then
+				currentSpawnIndex += 1
+				if currentSpawnIndex > #SPAWN_POINTS then
+					currentSpawnIndex = 1
 				end
+				targetPosition = SPAWN_POINTS[currentSpawnIndex]
 			end
 		end
 
 		if targetPosition then
 			local distance = (rootPart.Position - targetPosition).Magnitude
-			local duration = distance / currentSpeed -- Динамический расчёт времени от выставленной скорости
-			
+			local duration = distance / currentSpeed
 			local tweenInfo = TweenInfo.new(duration, Enum.EasingStyle.Linear)
-			local tween = TweenService:Create(rootPart, tweenInfo, {CFrame = CFrame.new(targetPosition)})
+			local tween = TweenService:Create(rootPart, tweenInfo, {
+				CFrame = CFrame.new(targetPosition),
+			})
+			activeTween = tween
 			tween:Play()
 
-			if nearest and distance <= 8 then
+			if nearest and distance <= math.max(0, actDist - 0.5) then
 				tween:Cancel()
+				if activeTween == tween then
+					activeTween = nil
+				end
 				interactWithObject(nearest.adornee)
 			else
 				tween.Completed:Wait()
+				if activeTween == tween then
+					activeTween = nil
+				end
 			end
 		end
 	end
 end
 
-refreshButton.Activated:Connect(scanWorkspace)
+refreshButton.Activated:Connect(function()
+	scanWorkspace(false)
+end)
 
 toggleButton.Activated:Connect(function()
 	scanning = not scanning
@@ -387,13 +418,20 @@ toggleButton.Activated:Connect(function()
 		local thisGeneration = scanGeneration
 		task.spawn(function()
 			while scanning and scanGeneration == thisGeneration and screenGui.Parent do
-				scanWorkspace()
+				scanWorkspace(true)
 				task.wait(SCAN_INTERVAL)
 			end
 		end)
 	else
+		if activeTween then
+			activeTween:Cancel()
+			activeTween = nil
+		end
+		if activePrompt then
+			activePrompt:InputHoldEnd()
+			activePrompt = nil
+		end
 		statusLabel.Text = "Автоматизация остановлена."
 		updateHighlight(nil)
 	end
 end)
-
